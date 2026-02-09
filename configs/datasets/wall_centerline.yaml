@@ -1,0 +1,15 @@
+dataset:
+  type: wall_centerline
+  name: wall_centerline
+  root: /home/bensunshine/ml-training-platform/wall_centerline/TopoLoRA‑SAM/processed
+  val_ratio: 0.15  # 15% of data for validation
+  size: 1024  # Match preprocessing tile_size
+  sar: false  # Not SAR imagery
+  batch_size: 1  # For A100 40GB with SAM
+  num_workers: 4
+  aug:
+    scale: [0.9, 1.1]  # Conservative for architecture
+    hflip: 0.5
+    vflip: 0.5
+    color_jitter_p: 0.1  # Light color jitter
+    gauss_noise_p: 0.0
