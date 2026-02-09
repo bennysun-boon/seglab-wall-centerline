@@ -125,7 +125,29 @@ def build_dataloaders(cfg: DictConfig) -> Tuple[DataLoader, DataLoader, DataLoad
 
 
 def run_experiment(cfg: DictConfig, tag: Optional[str] = None) -> Path:
-    load_dotenv()
+    # Load .env from project root
+    import os
+    from dotenv import load_dotenv as dotenv_load
+    from pathlib import Path
+
+    # Try multiple .env locations
+    env_paths = [
+        Path("/home/bensunshine/ml-training-platform/wall_centerline/TopoLoRA‑SAM/.env"),
+        Path(__file__).parent.parent.parent / ".env",
+        Path.cwd() / ".env",
+    ]
+    for env_path in env_paths:
+        if env_path.exists():
+            dotenv_load(env_path, override=True)
+            print(f"✅ Loaded .env from: {env_path}")
+            break
+
+    # Setup MLflow credentials
+    if 'MLFLOW_USERNAME' in os.environ:
+        os.environ['MLFLOW_TRACKING_USERNAME'] = os.environ['MLFLOW_USERNAME']
+    if 'MLFLOW_PASSWORD' in os.environ:
+        os.environ['MLFLOW_TRACKING_PASSWORD'] = os.environ['MLFLOW_PASSWORD']
+
     seed_everything(int(cfg.seed), deterministic=cfg.trainer.get("deterministic", True))
 
     run_dir = make_run_dir(
@@ -154,6 +176,27 @@ def run_experiment(cfg: DictConfig, tag: Optional[str] = None) -> Path:
 
     csv_logger = CSVLogger(save_dir=str(run_dir), name="logs")
     loggers = [csv_logger]
+
+    # MLflow logger
+    if cfg.logging.get("mlflow", False):
+        try:
+            from pytorch_lightning.loggers import MLFlowLogger
+            import os
+
+            tracking_uri = os.environ.get('MLFLOW_TRACKING_URI', 'https://mlflow-212833769695.us-east5.run.app/')
+            experiment_name = os.environ.get('EXPERIMENT_NAME', cfg.logging.get('mlflow_experiment', 'wall-semantic-segmentation'))
+            run_name = os.environ.get('RUN_NAME', f"{cfg.model.name}_{cfg.dataset.name}_seed{cfg.seed}")
+
+            mlflow_logger = MLFlowLogger(
+                experiment_name=experiment_name,
+                tracking_uri=tracking_uri,
+                run_name=run_name,
+            )
+            loggers.append(mlflow_logger)
+            print(f"✅ MLflow logging enabled: {experiment_name}")
+        except Exception as e:
+            print(f"⚠️  MLflow logging failed: {e}")
+
     if cfg.logging.get("wandb", False):
         try:
             from pytorch_lightning.loggers import WandbLogger
@@ -195,6 +238,17 @@ def run_experiment(cfg: DictConfig, tag: Optional[str] = None) -> Path:
     trainer.fit(lit_module, train_loader, val_loader)
     best_path = checkpoint_cb.best_model_path
     (run_dir / "best_ckpt.txt").write_text(best_path)
+
+    # Log best checkpoint to MLflow
+    if cfg.logging.get("mlflow", False) and best_path:
+        try:
+            import mlflow
+            print(f"\n📦 Uploading best checkpoint to MLflow/GCS...")
+            mlflow.log_artifact(best_path, artifact_path="model")
+            print(f"✅ Checkpoint uploaded: {Path(best_path).name}")
+        except Exception as e:
+            print(f"⚠️  Could not upload checkpoint: {e}")
+
     # Final test on best checkpoint
     test_results = trainer.test(lit_module, dataloaders=test_loader, ckpt_path="best")
     if test_results:

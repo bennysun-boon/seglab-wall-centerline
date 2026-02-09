@@ -57,6 +57,9 @@ scheduler:
 
 logging:
   wandb: false
+  mlflow: true
+  mlflow_validate: true
+  mlflow_experiment: wall-semantic-segmentation
   project: seglab
   entity: null
   tags: []
