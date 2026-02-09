@@ -114,6 +114,26 @@ def build_dataloaders(cfg: DictConfig) -> Tuple[DataLoader, DataLoader, DataLoad
         train_ds = SLSSDDDataset(root=root, split_files=train_files, transforms=tf_train)
         val_ds = SLSSDDDataset(root=root, split_files=val_files, transforms=tf_eval)
         test_ds = SLSSDDDataset(root=root, split_files=test_files, transforms=tf_eval)
+    elif ds_type == "wall_centerline":
+        from seglab.data.wall_centerline import WallCenterlineDataset
+
+        # Load metadata to get total count
+        metadata_path = Path(cfg.dataset.root) / "tile_metadata.json"
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
+        total_tiles = len(metadata["tiles"])
+
+        # Create splits
+        splits = make_split_indices(
+            total_tiles,
+            cfg.seed,
+            val_ratio=cfg.dataset.get("val_ratio", 0.15),
+            cache_path=cache_dir / "splits" / f"wall_centerline_seed{cfg.seed}.json",
+        )
+
+        train_ds = WallCenterlineDataset(cfg.dataset.root, splits["train"], tf_train)
+        val_ds = WallCenterlineDataset(cfg.dataset.root, splits["val"], tf_eval)
+        test_ds = WallCenterlineDataset(cfg.dataset.root, splits["test"], tf_eval)
     else:
         raise ValueError(f"Unknown dataset type: {ds_type}")
 
