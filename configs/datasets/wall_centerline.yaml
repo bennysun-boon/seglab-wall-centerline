@@ -5,7 +5,7 @@ dataset:
   val_ratio: 0.15  # 15% of data for validation
   size: 1024  # Match preprocessing tile_size
   sar: false  # Not SAR imagery
-  batch_size: 1  # For A100 40GB with SAM
+  batch_size: 4  # Optimized for A100 40GB (was 1, but only using 25% memory)
   num_workers: 4
   aug:
     scale: [0.9, 1.1]  # Conservative for architecture
