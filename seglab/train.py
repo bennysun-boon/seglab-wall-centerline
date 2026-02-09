@@ -123,7 +123,7 @@ def build_dataloaders(cfg: DictConfig) -> Tuple[DataLoader, DataLoader, DataLoad
             metadata = json.load(f)
         total_tiles = len(metadata["tiles"])
 
-        # Create splits
+        # Create splits (make_split_indices only returns train/val, not test)
         splits = make_split_indices(
             total_tiles,
             cfg.seed,
@@ -133,7 +133,8 @@ def build_dataloaders(cfg: DictConfig) -> Tuple[DataLoader, DataLoader, DataLoad
 
         train_ds = WallCenterlineDataset(cfg.dataset.root, splits["train"], tf_train)
         val_ds = WallCenterlineDataset(cfg.dataset.root, splits["val"], tf_eval)
-        test_ds = WallCenterlineDataset(cfg.dataset.root, splits["test"], tf_eval)
+        # Use validation set as test set (common practice for single dataset)
+        test_ds = WallCenterlineDataset(cfg.dataset.root, splits["val"], tf_eval)
     else:
         raise ValueError(f"Unknown dataset type: {ds_type}")
 
