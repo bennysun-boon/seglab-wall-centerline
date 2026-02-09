@@ -30,6 +30,7 @@ from seglab.utils import (
 )
 from seglab.utils.env import load_dotenv
 from seglab.utils.io import copy_code_snapshot
+from seglab.callbacks import MLflowCheckpointUploader, MLflowMetricsLogger
 
 
 def _merge_cfg(base_cfg: DictConfig, dataset_name: str, model_name: str) -> DictConfig:
@@ -197,6 +198,7 @@ def run_experiment(cfg: DictConfig, tag: Optional[str] = None) -> Path:
 
     csv_logger = CSVLogger(save_dir=str(run_dir), name="logs")
     loggers = [csv_logger]
+    mlflow_logger = None
 
     # MLflow logger
     if cfg.logging.get("mlflow", False):
@@ -215,8 +217,11 @@ def run_experiment(cfg: DictConfig, tag: Optional[str] = None) -> Path:
             )
             loggers.append(mlflow_logger)
             print(f"✅ MLflow logging enabled: {experiment_name}")
+            print(f"   Tracking URI: {tracking_uri}")
+            print(f"   Run name: {run_name}")
         except Exception as e:
             print(f"⚠️  MLflow logging failed: {e}")
+            mlflow_logger = None
 
     if cfg.logging.get("wandb", False):
         try:
@@ -242,6 +247,16 @@ def run_experiment(cfg: DictConfig, tag: Optional[str] = None) -> Path:
     )
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
 
+    # Setup callbacks list
+    callbacks = [checkpoint_cb, lr_monitor]
+
+    # Add MLflow callbacks if enabled
+    if mlflow_logger is not None:
+        mlflow_uploader = MLflowCheckpointUploader(mlflow_logger)
+        mlflow_metrics = MLflowMetricsLogger(mlflow_logger)
+        callbacks.extend([mlflow_uploader, mlflow_metrics])
+        print(f"✅ MLflow checkpoint auto-upload enabled (uploads after each validation)")
+
     trainer = pl.Trainer(
         max_epochs=cfg.trainer.max_epochs,
         accelerator=cfg.trainer.accelerator,
@@ -251,7 +266,7 @@ def run_experiment(cfg: DictConfig, tag: Optional[str] = None) -> Path:
         log_every_n_steps=cfg.trainer.log_every_n_steps,
         deterministic=cfg.trainer.get("deterministic", True),
         gradient_clip_val=cfg.trainer.get("gradient_clip_val", 0.0),
-        callbacks=[checkpoint_cb, lr_monitor],
+        callbacks=callbacks,
         logger=loggers,
         default_root_dir=str(run_dir),
     )
@@ -260,15 +275,18 @@ def run_experiment(cfg: DictConfig, tag: Optional[str] = None) -> Path:
     best_path = checkpoint_cb.best_model_path
     (run_dir / "best_ckpt.txt").write_text(best_path)
 
-    # Log best checkpoint to MLflow
-    if cfg.logging.get("mlflow", False) and best_path:
+    # Final checkpoint upload (if MLflow callbacks weren't used)
+    if cfg.logging.get("mlflow", False) and best_path and mlflow_logger is None:
         try:
             import mlflow
-            print(f"\n📦 Uploading best checkpoint to MLflow/GCS...")
+            print(f"\n📦 Uploading final checkpoint to MLflow/GCS...")
             mlflow.log_artifact(best_path, artifact_path="model")
             print(f"✅ Checkpoint uploaded: {Path(best_path).name}")
         except Exception as e:
             print(f"⚠️  Could not upload checkpoint: {e}")
+    elif mlflow_logger is not None:
+        print(f"\n✅ Training complete! Best checkpoint already uploaded to MLflow/GCS")
+        print(f"   Checkpoint: {Path(best_path).name}")
 
     # Final test on best checkpoint
     test_results = trainer.test(lit_module, dataloaders=test_loader, ckpt_path="best")
