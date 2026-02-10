@@ -26,5 +26,6 @@ loss:
 dataset:
   batch_size: 1
 
-trainer:
-  accumulate_grad_batches: 1  # Reduced since batch_size increased to 4
+# trainer settings moved to experiment config to avoid override issues
+# trainer:
+#   accumulate_grad_batches: 4

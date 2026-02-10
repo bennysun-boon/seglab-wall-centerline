@@ -12,11 +12,14 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint, EarlyStopping, TQDMProgressBar
 from pytorch_lightning.loggers import CSVLogger
 from omegaconf import OmegaConf, DictConfig
 import torch
 from torch.utils.data import DataLoader, Subset
+
+# Enable TensorFloat-32 for faster FP32 training on A100
+torch.set_float32_matmul_precision('high')
 
 from seglab.data import HFRetinaDataset, HFKvasirDataset, SLSSDDDataset, build_transforms
 from seglab.data.splits import make_split_indices
@@ -184,6 +187,18 @@ def run_experiment(cfg: DictConfig, tag: Optional[str] = None) -> Path:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     save_config(cfg, run_dir)
+
+    # Debug: Print actual accumulate_grad_batches value
+    actual_accumulate = cfg.trainer.get("accumulate_grad_batches", 1)
+    print(f"\n{'='*60}")
+    print(f"TRAINING CONFIGURATION CHECK")
+    print(f"{'='*60}")
+    print(f"accumulate_grad_batches: {actual_accumulate}")
+    print(f"batch_size: {cfg.dataset.batch_size}")
+    print(f"Effective batch size: {actual_accumulate * cfg.dataset.batch_size}")
+    print(f"Expected steps per epoch: {18486 // (actual_accumulate * cfg.dataset.batch_size)}")
+    print(f"{'='*60}\n")
+
     env_info = collect_env_info()
     (run_dir / "env.json").write_text(json.dumps(env_info, indent=2))
     copy_code_snapshot(run_dir)
@@ -247,8 +262,23 @@ def run_experiment(cfg: DictConfig, tag: Optional[str] = None) -> Path:
     )
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
 
+    # Early stopping: stop if no improvement for 5 epochs
+    early_stop_patience = cfg.trainer.get("early_stop_patience", 5)
+    early_stop_cb = EarlyStopping(
+        monitor="val/dice",
+        patience=early_stop_patience,
+        mode="max",
+        verbose=True,
+        min_delta=0.001,  # Minimum change to qualify as improvement
+    )
+
+    # Custom progress bar for cleaner log files
+    progress_bar = TQDMProgressBar(refresh_rate=100)  # Update every 100 steps instead of every step
+
     # Setup callbacks list
-    callbacks = [checkpoint_cb, lr_monitor]
+    callbacks = [checkpoint_cb, lr_monitor, early_stop_cb, progress_bar]
+    print(f"✅ Early stopping enabled (patience={early_stop_patience} epochs)")
+    print(f"✅ Progress bar refresh rate: 100 steps (cleaner logs)")
 
     # Add MLflow callbacks if enabled
     if mlflow_logger is not None:
@@ -271,7 +301,12 @@ def run_experiment(cfg: DictConfig, tag: Optional[str] = None) -> Path:
         default_root_dir=str(run_dir),
     )
 
-    trainer.fit(lit_module, train_loader, val_loader)
+    # Resume from checkpoint if specified
+    ckpt_path = cfg.get("ckpt_path", None)
+    if ckpt_path:
+        print(f"\n🔄 Resuming training from checkpoint: {ckpt_path}")
+
+    trainer.fit(lit_module, train_loader, val_loader, ckpt_path=ckpt_path)
     best_path = checkpoint_cb.best_model_path
     (run_dir / "best_ckpt.txt").write_text(best_path)
 
