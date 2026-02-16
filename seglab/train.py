@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader, Subset
 torch.set_float32_matmul_precision('high')
 
 from seglab.data import HFRetinaDataset, HFKvasirDataset, SLSSDDDataset, build_transforms
-from seglab.data.splits import make_split_indices
+from seglab.data.splits import make_split_indices, make_split_indices_with_test
 from seglab.utils import (
     seed_everything,
     load_config,
@@ -127,18 +127,18 @@ def build_dataloaders(cfg: DictConfig) -> Tuple[DataLoader, DataLoader, DataLoad
             metadata = json.load(f)
         total_tiles = len(metadata["tiles"])
 
-        # Create splits (make_split_indices only returns train/val, not test)
-        splits = make_split_indices(
+        # Create proper train/val/test splits (75/15/15)
+        splits = make_split_indices_with_test(
             total_tiles,
             cfg.seed,
             val_ratio=cfg.dataset.get("val_ratio", 0.15),
+            test_ratio=cfg.dataset.get("test_ratio", 0.15),
             cache_path=cache_dir / "splits" / f"wall_centerline_seed{cfg.seed}.json",
         )
 
         train_ds = WallCenterlineDataset(cfg.dataset.root, splits["train"], tf_train)
         val_ds = WallCenterlineDataset(cfg.dataset.root, splits["val"], tf_eval)
-        # Use validation set as test set (common practice for single dataset)
-        test_ds = WallCenterlineDataset(cfg.dataset.root, splits["val"], tf_eval)
+        test_ds = WallCenterlineDataset(cfg.dataset.root, splits["test"], tf_eval)
     else:
         raise ValueError(f"Unknown dataset type: {ds_type}")
 
