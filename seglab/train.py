@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader, Subset
 torch.set_float32_matmul_precision('high')
 
 from seglab.data import HFRetinaDataset, HFKvasirDataset, SLSSDDDataset, build_transforms
-from seglab.data.splits import make_split_indices, make_split_indices_with_test
+from seglab.data.splits import make_split_indices, make_split_indices_with_test, make_split_indices_by_group
 from seglab.utils import (
     seed_everything,
     load_config,
@@ -121,20 +121,34 @@ def build_dataloaders(cfg: DictConfig) -> Tuple[DataLoader, DataLoader, DataLoad
     elif ds_type == "wall_centerline":
         from seglab.data.wall_centerline import WallCenterlineDataset
 
-        # Load metadata to get total count
+        # Load metadata to get tiles
         metadata_path = Path(cfg.dataset.root) / "tile_metadata.json"
         with open(metadata_path, "r") as f:
             metadata = json.load(f)
-        total_tiles = len(metadata["tiles"])
+        tiles = metadata["tiles"]
 
-        # Create proper train/val/test splits (75/15/15)
-        splits = make_split_indices_with_test(
-            total_tiles,
+        # Create train/val/test splits by PDF (prevents data leakage from overlapping tiles)
+        # All tiles from the same PDF will be in the same split
+        splits = make_split_indices_by_group(
+            tiles,
             cfg.seed,
+            group_key="source_pdf",
             val_ratio=cfg.dataset.get("val_ratio", 0.15),
             test_ratio=cfg.dataset.get("test_ratio", 0.15),
-            cache_path=cache_dir / "splits" / f"wall_centerline_seed{cfg.seed}.json",
+            cache_path=cache_dir / "splits" / f"wall_centerline_by_pdf_seed{cfg.seed}.json",
         )
+
+        # Print split information
+        if "_metadata" in splits:
+            meta = splits["_metadata"]
+            print(f"\n{'='*60}")
+            print(f"DATASET SPLITS (by PDF to prevent data leakage)")
+            print(f"{'='*60}")
+            print(f"Total PDFs: {meta['total_groups']}")
+            print(f"  Train: {meta['train_groups']} PDFs ({meta['train_tiles']} tiles)")
+            print(f"  Val:   {meta['val_groups']} PDFs ({meta['val_tiles']} tiles)")
+            print(f"  Test:  {meta['test_groups']} PDFs ({meta['test_tiles']} tiles)")
+            print(f"{'='*60}\n")
 
         train_ds = WallCenterlineDataset(cfg.dataset.root, splits["train"], tf_train)
         val_ds = WallCenterlineDataset(cfg.dataset.root, splits["val"], tf_eval)
@@ -208,6 +222,23 @@ def run_experiment(cfg: DictConfig, tag: Optional[str] = None) -> Path:
     model_builder = get_model(cfg.model.name)
     lit_module = model_builder(cfg)
 
+    # Transfer learning: load model weights only (fresh optimizer, epoch 0)
+    transfer_ckpt = cfg.get("transfer_ckpt", None)
+    if transfer_ckpt:
+        print(f"\n{'='*60}")
+        print(f"TRANSFER LEARNING")
+        print(f"{'='*60}")
+        print(f"Loading weights from: {transfer_ckpt}")
+        ckpt = torch.load(transfer_ckpt, map_location="cpu")
+        state_dict = ckpt.get("state_dict", ckpt)
+        missing, unexpected = lit_module.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"  Missing keys: {len(missing)} (expected for fresh components)")
+        if unexpected:
+            print(f"  Unexpected keys: {len(unexpected)}")
+        print(f"Model weights loaded. Optimizer and scheduler will start fresh.")
+        print(f"{'='*60}\n")
+
     trainable_params = sum(p.numel() for p in lit_module.parameters() if p.requires_grad)
     (run_dir / "trainable_params.txt").write_text(str(trainable_params))
 
@@ -258,7 +289,7 @@ def run_experiment(cfg: DictConfig, tag: Optional[str] = None) -> Path:
         monitor="val/dice",
         mode="max",
         save_top_k=1,
-        filename="{epoch}-{val_dice:.4f}",
+        filename="{epoch}-{val/dice:.4f}",
     )
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
 
@@ -301,10 +332,11 @@ def run_experiment(cfg: DictConfig, tag: Optional[str] = None) -> Path:
         default_root_dir=str(run_dir),
     )
 
-    # Resume from checkpoint if specified
-    ckpt_path = cfg.get("ckpt_path", None)
+    # Resume from checkpoint if specified (full resume, NOT transfer learning)
+    # For transfer learning use transfer_ckpt instead (weights only, fresh optimizer)
+    ckpt_path = cfg.get("ckpt_path", None) if not transfer_ckpt else None
     if ckpt_path:
-        print(f"\n🔄 Resuming training from checkpoint: {ckpt_path}")
+        print(f"\nResuming training from checkpoint: {ckpt_path}")
 
     trainer.fit(lit_module, train_loader, val_loader, ckpt_path=ckpt_path)
     best_path = checkpoint_cb.best_model_path
@@ -315,7 +347,7 @@ def run_experiment(cfg: DictConfig, tag: Optional[str] = None) -> Path:
         try:
             import mlflow
             print(f"\n📦 Uploading final checkpoint to MLflow/GCS...")
-            mlflow.log_artifact(best_path, artifact_path="model")
+            mlflow.log_artifact(best_path, "models")
             print(f"✅ Checkpoint uploaded: {Path(best_path).name}")
         except Exception as e:
             print(f"⚠️  Could not upload checkpoint: {e}")
@@ -324,9 +356,41 @@ def run_experiment(cfg: DictConfig, tag: Optional[str] = None) -> Path:
         print(f"   Checkpoint: {Path(best_path).name}")
 
     # Final test on best checkpoint
+    print("\n" + "="*60)
+    print("Evaluating on test set...")
+    print("="*60)
     test_results = trainer.test(lit_module, dataloaders=test_loader, ckpt_path="best")
+
     if test_results:
-        (run_dir / "test_metrics.json").write_text(json.dumps(test_results[0], indent=2))
+        test_metrics = test_results[0]
+
+        # Save to JSON
+        (run_dir / "test_metrics.json").write_text(json.dumps(test_metrics, indent=2))
+
+        # Log test metrics to MLflow (matching UNet style)
+        if cfg.logging.get("mlflow", False) and mlflow_logger is not None:
+            try:
+                import mlflow
+
+                # Log all test metrics to MLflow
+                with mlflow.start_run(run_id=mlflow_logger.run_id):
+                    mlflow.log_metrics({
+                        key: value for key, value in test_metrics.items()
+                        if isinstance(value, (int, float))
+                    })
+
+                print("\n" + "="*60)
+                print("Test Evaluation Complete!")
+                print("="*60)
+                print(f"Test metrics logged to MLflow")
+                for key, value in test_metrics.items():
+                    if isinstance(value, (int, float)):
+                        print(f"  {key}: {value:.4f}")
+                print("="*60)
+
+            except Exception as e:
+                print(f"⚠️  Could not log test metrics to MLflow: {e}")
+
     return run_dir
 
 

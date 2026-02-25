@@ -1,12 +1,11 @@
-# Stable training configuration for wall centerline detection
-# Fixes for gradient explosion issue at epoch 7
-# Resume from epoch 5 checkpoint with these settings
+# Ceiling/floor border segmentation - fine-tuned from wall centerline model
+# Transfer learning: wall model (epoch 22) -> ceiling/floor pattern borders
 
-experiment: wall_centerline_stable
+experiment: ceil_floor_border_stable
 seed: 0
 
-# Training from scratch with stable config (FP32, lower LR, tighter grad clip)
-# ckpt_path: null  # Start fresh - epoch 5 checkpoint was overwritten
+# Transfer learning: load model weights only (fresh optimizer, starts at epoch 0)
+transfer_ckpt: checkpoints/wall_centerline_epoch22.ckpt
 
 paths:
   results_dir: results
@@ -16,7 +15,7 @@ paths:
   cache_dir: cache
 
 trainer:
-  max_epochs: 30  # Reduced from 50
+  max_epochs: 80  # Early stopping will halt sooner if converged
   accelerator: gpu
   devices: 1
   precision: 32  # FP32 with TF32 for numerical stability + speed
@@ -29,7 +28,7 @@ trainer:
 dataset:
   type: wall_centerline
   name: wall_centerline
-  root: /home/bensunshine/ml-training-platform/wall_centerline/TopoLoRA‑SAM/processed
+  root: /home/bensunshine/ml-training-platform/wall_centerline/TopoLoRA-SAM/processed_ceil_floor
   train_split: train
   test_split: test
   val_ratio: 0.15
@@ -70,21 +69,21 @@ loss:
 
 optimizer:
   name: adamw
-  lr: 5e-5  # Reduced from 1e-4 for more stable fine-tuning
+  lr: 2e-5  # Lower LR for transfer learning from wall model
   weight_decay: 1e-4
 
 scheduler:
   name: cosine  # Cosine annealing for smooth LR decay
-  warmup_epochs: 0  # No warmup since resuming from trained model
+  warmup_epochs: 0  # No warmup - starting from pretrained weights already in good basin
 
 logging:
   wandb: false
   mlflow: true
   mlflow_validate: true
-  mlflow_experiment: wall-semantic-segmentation
+  mlflow_experiment: ceil-floor-border-segmentation
   project: seglab
   entity: null
-  tags: ["stable", "resume_from_epoch5", "fp32", "lower_lr"]
+  tags: ["ceil_floor", "transfer_from_wall_ep22", "fp32", "lr_2e-5"]
 
 artifacts:
   save_test_preds: true

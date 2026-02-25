@@ -61,19 +61,22 @@ class MLflowCheckpointUploader(Callback):
             checkpoint_name = Path(best_model_path).name
             current_epoch = trainer.current_epoch
 
-            print(f"\n📦 Uploading checkpoint to MLflow/GCS (epoch {current_epoch})...")
-            print(f"   Path: {checkpoint_name}")
+            # Get current metrics for printing
+            checkpoint_callback = None
+            for callback in trainer.callbacks:
+                if isinstance(callback, pl.callbacks.ModelCheckpoint):
+                    checkpoint_callback = callback
+                    break
 
-            # Upload the checkpoint as an artifact
-            mlflow.log_artifact(best_model_path, artifact_path="model")
+            metric_value = ""
+            if checkpoint_callback and checkpoint_callback.best_model_score is not None:
+                metric_value = f" ({checkpoint_callback.monitor}: {checkpoint_callback.best_model_score:.4f})"
 
-            # Also log the GCS path as a parameter for easy access
-            # MLflow stores artifacts in GCS, and we can retrieve the URI
-            artifact_uri = mlflow.get_artifact_uri("model")
-            mlflow.log_param(f"best_checkpoint_epoch_{current_epoch}", checkpoint_name)
-
-            print(f"✅ Checkpoint uploaded successfully!")
-            print(f"   Artifact URI: {artifact_uri}/{checkpoint_name}")
+            # Log best model to MLflow/GCS using the logger's run context
+            run_id = self.mlflow_logger.run_id
+            with mlflow.start_run(run_id=run_id):
+                mlflow.log_artifact(best_model_path, "models")
+            print(f"✓ Saved best model{metric_value} - uploaded to GCS")
 
             # Track this as the last uploaded checkpoint
             self._last_uploaded_path = best_model_path
@@ -105,9 +108,11 @@ class MLflowMetricsLogger(Callback):
             total_params = sum(p.numel() for p in pl_module.parameters())
             trainable_params = sum(p.numel() for p in pl_module.parameters() if p.requires_grad)
 
-            mlflow.log_param("total_parameters", total_params)
-            mlflow.log_param("trainable_parameters", trainable_params)
-            mlflow.log_param("trainable_percentage", f"{100 * trainable_params / total_params:.2f}%")
+            run_id = self.mlflow_logger.run_id
+            with mlflow.start_run(run_id=run_id):
+                mlflow.log_param("total_parameters", total_params)
+                mlflow.log_param("trainable_parameters", trainable_params)
+                mlflow.log_param("trainable_percentage", f"{100 * trainable_params / total_params:.2f}%")
 
         except Exception as e:
             print(f"⚠️  Failed to log training info: {e}")
@@ -121,7 +126,9 @@ class MLflowMetricsLogger(Callback):
             import mlflow
 
             # Log epoch number explicitly
-            mlflow.log_metric("epoch", trainer.current_epoch, step=trainer.global_step)
+            run_id = self.mlflow_logger.run_id
+            with mlflow.start_run(run_id=run_id):
+                mlflow.log_metric("epoch", trainer.current_epoch, step=trainer.global_step)
 
         except Exception as e:
             pass  # Silently fail for non-critical logging

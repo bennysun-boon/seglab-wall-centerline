@@ -13,7 +13,7 @@ trainer:
   accelerator: gpu
   devices: 1
   precision: 16-mixed
-  accumulate_grad_batches: 1
+  accumulate_grad_batches: 4  # Optimized: 1 → 4 (effective batch size = 16)
   log_every_n_steps: 10
   deterministic: warn
   gradient_clip_val: 1.0

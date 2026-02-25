@@ -24,7 +24,7 @@ loss:
 
 # SAM is heavy; default to smaller batch with accumulation.
 dataset:
-  batch_size: 1
+  batch_size: 4  # Optimized: 1 → 4 for better GPU utilization
 
 # trainer settings moved to experiment config to avoid override issues
 # trainer:

@@ -1,8 +1,11 @@
 dataset:
   type: wall_centerline
   name: wall_centerline
-  root: /home/bensunshine/ml-training-platform/wall_centerline/TopoLoRA‑SAM/processed
-  val_ratio: 0.15  # 15% of data for validation
+  root: /home/bensunshine/ml-training-platform/wall_centerline/TopoLoRA-SAM/processed_ceil_floor
+  # Split strategy: By PDF (not by tile) to prevent data leakage from overlapping tiles
+  # All tiles from the same source PDF are kept together in the same split
+  val_ratio: 0.15   # 15% of PDFs for validation
+  test_ratio: 0.15  # 15% of PDFs for test (70% for training)
   size: 1024  # Match preprocessing tile_size
   sar: false  # Not SAR imagery
   batch_size: 1  # Use gradient accumulation instead (set in model config)
