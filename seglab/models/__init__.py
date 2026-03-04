@@ -145,6 +145,17 @@ class LitBinarySeg(pl.LightningModule):
             loss = loss + junction_weight * junction_loss
             self.log(f"{stage}/junction_loss", junction_loss, on_step=False, on_epoch=True)
 
+            # Log junction dice for monitoring/early-stopping
+            with torch.no_grad():
+                pred = torch.sigmoid(junction_logits)
+                target_f = junction_target.float()
+                if target_f.ndim == 3:
+                    target_f = target_f.unsqueeze(1)
+                inter = (pred * target_f).sum()
+                union = pred.sum() + target_f.sum()
+                junc_dice = (2.0 * inter + 1e-6) / (union + 1e-6)
+            self.log(f"{stage}/junction_dice", junc_dice, on_step=False, on_epoch=True, prog_bar=(stage == "val"))
+
         probs = torch.sigmoid(seg_logits)
         meter = getattr(self, f"{stage}_meter")
         meter.update(probs.detach(), y.detach())

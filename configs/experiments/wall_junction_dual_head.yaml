@@ -30,7 +30,7 @@ trainer:
 dataset:
   type: wall_centerline
   name: wall_centerline
-  root: /home/bensunshine/ml-training-platform/wall_centerline/TopoLoRA-SAM/processed
+  root: /home/bensunshine/ml-training-platform/wall_centerline/TopoLoRA-SAM/processed_endpoints
   val_ratio: 0.15
   size: 1024
   sar: false

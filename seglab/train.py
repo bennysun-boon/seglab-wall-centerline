@@ -294,23 +294,33 @@ def run_experiment(cfg: DictConfig, tag: Optional[str] = None) -> Path:
         except Exception as e:
             print(f"[warn] wandb logging requested but unavailable: {e}")
 
+    # Use junction_dice for monitoring when junction head is active and seg is frozen
+    has_junction = cfg.model.get("junction_head", {}).get("enabled", False)
+    freeze_existing = cfg.get("freeze_existing", False)
+    if has_junction and freeze_existing:
+        monitor_metric = "val/junction_dice"
+        ckpt_filename = "{epoch}-{val/junction_dice:.4f}"
+    else:
+        monitor_metric = "val/dice"
+        ckpt_filename = "{epoch}-{val/dice:.4f}"
+
     checkpoint_cb = ModelCheckpoint(
         dirpath=str(ckpt_dir),
-        monitor="val/dice",
+        monitor=monitor_metric,
         mode="max",
         save_top_k=1,
-        filename="{epoch}-{val/dice:.4f}",
+        filename=ckpt_filename,
     )
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
 
-    # Early stopping: stop if no improvement for 5 epochs
+    # Early stopping: stop if no improvement for N epochs
     early_stop_patience = cfg.trainer.get("early_stop_patience", 5)
     early_stop_cb = EarlyStopping(
-        monitor="val/dice",
+        monitor=monitor_metric,
         patience=early_stop_patience,
         mode="max",
         verbose=True,
-        min_delta=0.001,  # Minimum change to qualify as improvement
+        min_delta=0.001,
     )
 
     # Custom progress bar for cleaner log files
