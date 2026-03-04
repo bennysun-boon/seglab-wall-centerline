@@ -16,6 +16,7 @@ def build_transforms(
     train: bool = True,
     sar: bool = False,
     aug: Optional[Dict[str, Any]] = None,
+    junction_heatmap: bool = False,
 ) -> A.Compose:
     aug = aug or {}
     if train:
@@ -46,4 +47,9 @@ def build_transforms(
             A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
             ToTensorV2(),
         ]
-    return A.Compose(tfs)
+
+    additional_targets = {}
+    if junction_heatmap:
+        additional_targets["junction_heatmap"] = "mask"
+
+    return A.Compose(tfs, additional_targets=additional_targets)

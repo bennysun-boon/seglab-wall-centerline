@@ -150,9 +150,19 @@ def build_dataloaders(cfg: DictConfig) -> Tuple[DataLoader, DataLoader, DataLoad
             print(f"  Test:  {meta['test_groups']} PDFs ({meta['test_tiles']} tiles)")
             print(f"{'='*60}\n")
 
-        train_ds = WallCenterlineDataset(cfg.dataset.root, splits["train"], tf_train)
-        val_ds = WallCenterlineDataset(cfg.dataset.root, splits["val"], tf_eval)
-        test_ds = WallCenterlineDataset(cfg.dataset.root, splits["test"], tf_eval)
+        junction_heatmap = bool(cfg.dataset.get("junction_heatmap", False))
+        if junction_heatmap:
+            tf_train = build_transforms(size=size, train=True, sar=cfg.dataset.get("sar", False),
+                                        aug=cfg.dataset.get("aug"), junction_heatmap=True)
+            tf_eval = build_transforms(size=size, train=False, sar=cfg.dataset.get("sar", False),
+                                       junction_heatmap=True)
+
+        train_ds = WallCenterlineDataset(cfg.dataset.root, splits["train"], tf_train,
+                                         junction_heatmap=junction_heatmap)
+        val_ds = WallCenterlineDataset(cfg.dataset.root, splits["val"], tf_eval,
+                                       junction_heatmap=junction_heatmap)
+        test_ds = WallCenterlineDataset(cfg.dataset.root, splits["test"], tf_eval,
+                                        junction_heatmap=junction_heatmap)
     else:
         raise ValueError(f"Unknown dataset type: {ds_type}")
 
@@ -406,6 +416,8 @@ def main() -> None:
     dataset_name = args.dataset or base_cfg.dataset.name
     model_name = args.model or base_cfg.model.name
     cfg = _merge_cfg(base_cfg, dataset_name, model_name)
+    # Re-merge experiment config so it takes precedence over defaults
+    cfg = OmegaConf.merge(cfg, base_cfg)
     if args.overrides:
         cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(list(args.overrides)))
 

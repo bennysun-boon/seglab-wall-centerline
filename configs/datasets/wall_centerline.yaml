@@ -8,6 +8,7 @@ dataset:
   test_ratio: 0.15  # 15% of PDFs for test (70% for training)
   size: 1024  # Match preprocessing tile_size
   sar: false  # Not SAR imagery
+  junction_heatmap: false  # set true to load junction heatmaps for dual-head training
   batch_size: 1  # Use gradient accumulation instead (set in model config)
   num_workers: 4
   aug:

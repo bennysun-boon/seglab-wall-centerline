@@ -31,6 +31,17 @@ class LitBinarySeg(pl.LightningModule):
         self.cfg = cfg
         self.save_hyperparameters(OmegaConf.to_container(cfg, resolve=True))  # type: ignore
 
+        # Detect if junction head is active
+        self._has_junction_head = (
+            hasattr(net, "junction_head") and net.junction_head is not None
+        )
+
+        # Freeze existing params if configured (for transfer learning)
+        if getattr(cfg, "freeze_existing", False) and self._has_junction_head:
+            for name, param in net.named_parameters():
+                if "junction_head" not in name:
+                    param.requires_grad = False
+
         self.train_meter = SegmentationMeter()
         self.val_meter = SegmentationMeter()
         self.test_meter = SegmentationMeter()
@@ -50,15 +61,22 @@ class LitBinarySeg(pl.LightningModule):
         self._worst_samples: List[Tuple[float, np.ndarray, np.ndarray, np.ndarray]] = []
         self._rng = np.random.default_rng(int(getattr(cfg, "seed", 0)))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        logits = self.net(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        out = self.net(x)
+        if isinstance(out, (tuple, list)) and len(out) == 2 and self._has_junction_head:
+            seg_logits, junction_logits = out
+            if seg_logits.ndim == 3:
+                seg_logits = seg_logits.unsqueeze(1)
+            return seg_logits, junction_logits
+        # Backward compatible: single-head
+        logits = out
         if isinstance(logits, (tuple, list)):
             logits = logits[0]
         if logits.ndim == 3:
             logits = logits.unsqueeze(1)
         return logits
 
-    def _compute_loss(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def _compute_seg_loss(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         target_f = target.float().unsqueeze(1)
         bce = F.binary_cross_entropy_with_logits(logits, target_f)
         dice = dice_loss(torch.sigmoid(logits), target_f)
@@ -78,13 +96,56 @@ class LitBinarySeg(pl.LightningModule):
             )
         return loss
 
+    def _compute_junction_loss(self, junction_logits: torch.Tensor,
+                               junction_target: torch.Tensor) -> torch.Tensor:
+        """MSE + Dice loss on junction heatmap predictions."""
+        # junction_target: (B, H, W) float [0,1] -> (B, 1, H, W)
+        target_f = junction_target.float()
+        if target_f.ndim == 3:
+            target_f = target_f.unsqueeze(1)
+
+        pred = torch.sigmoid(junction_logits)
+
+        mse = F.mse_loss(pred, target_f)
+        d = dice_loss(pred, target_f)
+
+        mse_w = getattr(self.cfg.loss, "junction_mse_weight", 1.0)
+        dice_w = getattr(self.cfg.loss, "junction_dice_weight", 1.0)
+
+        return mse_w * mse + dice_w * d
+
     def _shared_step(self, batch: Dict[str, torch.Tensor], stage: str) -> torch.Tensor:
         x = batch["image"]
         y = batch["mask"]
-        logits = self(x)
-        loss = self._compute_loss(logits, y)
-        probs = torch.sigmoid(logits)
+        out = self(x)
 
+        # Dual-head: (seg_logits, junction_logits) when junction head is active
+        has_junction_target = "junction_heatmap" in batch
+        if isinstance(out, tuple) and self._has_junction_head:
+            seg_logits, junction_logits = out
+        else:
+            seg_logits = out
+            junction_logits = None
+
+        # Segmentation loss (skip if existing params are frozen)
+        freeze_existing = getattr(self.cfg, "freeze_existing", False)
+        if freeze_existing and self._has_junction_head:
+            seg_loss = torch.tensor(0.0, device=x.device)
+        else:
+            seg_loss = self._compute_seg_loss(seg_logits, y)
+
+        loss = seg_loss
+        self.log(f"{stage}/seg_loss", seg_loss, on_step=False, on_epoch=True)
+
+        # Junction heatmap loss
+        if junction_logits is not None and has_junction_target:
+            junction_target = batch["junction_heatmap"]
+            junction_loss = self._compute_junction_loss(junction_logits, junction_target)
+            junction_weight = getattr(self.cfg.loss, "junction_weight", 1.0)
+            loss = loss + junction_weight * junction_loss
+            self.log(f"{stage}/junction_loss", junction_loss, on_step=False, on_epoch=True)
+
+        probs = torch.sigmoid(seg_logits)
         meter = getattr(self, f"{stage}_meter")
         meter.update(probs.detach(), y.detach())
         self.log(f"{stage}/loss", loss, prog_bar=(stage != "train"), on_step=False, on_epoch=True)
@@ -99,8 +160,9 @@ class LitBinarySeg(pl.LightningModule):
     def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
         x = batch["image"]
         y = batch["mask"]
-        logits = self(x)
-        loss = self._compute_loss(logits, y)
+        out = self(x)
+        logits = out[0] if isinstance(out, tuple) else out
+        loss = self._compute_seg_loss(logits, y)
         probs = torch.sigmoid(logits)
         self.test_meter.update(probs.detach(), y.detach())
         self.log("test/loss", loss, prog_bar=True, on_step=False, on_epoch=True)

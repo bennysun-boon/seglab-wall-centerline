@@ -15,6 +15,31 @@ from seglab.models.sam_peft.sam_loader import load_sam
 from seglab.utils.registry import register_model
 
 
+class JunctionHeatmapHead(nn.Module):
+    """Lightweight head that predicts junction/endpoint heatmaps from SAM image embeddings."""
+
+    def __init__(self, in_channels: int = 256, hidden_dim: int = 128):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, hidden_dim, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(hidden_dim)
+        self.act = nn.GELU()
+        self.conv2 = nn.Conv2d(hidden_dim, 1, 1)
+
+    def forward(self, image_embeddings: torch.Tensor, output_size: tuple[int, int]) -> torch.Tensor:
+        """
+        Args:
+            image_embeddings: (B, C, H_emb, W_emb) from SAM encoder
+            output_size: (H, W) target spatial size
+
+        Returns:
+            Heatmap logits (B, 1, H, W)
+        """
+        x = self.act(self.bn1(self.conv1(image_embeddings)))
+        x = self.conv2(x)
+        x = F.interpolate(x, size=output_size, mode="bilinear", align_corners=False)
+        return x
+
+
 class SAMPEFTNet(nn.Module):
     def __init__(self, cfg: Any):
         super().__init__()
@@ -48,7 +73,16 @@ class SAMPEFTNet(nn.Module):
             for p in self.sam.mask_decoder.parameters():
                 p.requires_grad = True
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Optional junction heatmap head
+        self.junction_head: Optional[JunctionHeatmapHead] = None
+        junc_cfg = cfg.model.get("junction_head", {})
+        if junc_cfg.get("enabled", False):
+            self.junction_head = JunctionHeatmapHead(
+                in_channels=256,
+                hidden_dim=junc_cfg.get("hidden_dim", 128),
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # SAM expects inputs normalized with its own pixel_mean/std and padded to img_size.
         # Our datasets use ImageNet normalization; invert it back to [0, 255] RGB first.
         imagenet_mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1, 3, 1, 1)
@@ -76,6 +110,11 @@ class SAMPEFTNet(nn.Module):
             multimask_output=False,
         )
         masks = F.interpolate(low_res_masks, size=x.shape[-2:], mode="bilinear", align_corners=False)
+
+        if self.junction_head is not None:
+            junction_heatmap = self.junction_head(image_embeddings, output_size=x.shape[-2:])
+            return masks, junction_heatmap
+
         return masks
 
 

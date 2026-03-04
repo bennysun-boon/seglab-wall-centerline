@@ -26,12 +26,14 @@ class WallCenterlineDataset(Dataset):
         root: str | Path,
         split_indices: list[int],
         transform: Optional[Any] = None,
+        junction_heatmap: bool = False,
     ):
         """
         Args:
             root: Path to processed data directory
             split_indices: List of tile indices for this split
             transform: Albumentations transform
+            junction_heatmap: Whether to load junction heatmaps
         """
         self.root = Path(root)
         self.transform = transform
@@ -50,7 +52,14 @@ class WallCenterlineDataset(Dataset):
         all_tiles = metadata["tiles"]
         self.tiles = [all_tiles[i] for i in split_indices if i < len(all_tiles)]
 
-        print(f"WallCenterlineDataset: {len(self.tiles)} tiles")
+        # Check if junction heatmaps are available and requested
+        self.has_junction_heatmaps = (
+            junction_heatmap
+            and (self.root / "junction_heatmaps").is_dir()
+        )
+
+        print(f"WallCenterlineDataset: {len(self.tiles)} tiles"
+              f"{', with junction heatmaps' if self.has_junction_heatmaps else ''}")
 
     def __len__(self) -> int:
         return len(self.tiles)
@@ -69,16 +78,32 @@ class WallCenterlineDataset(Dataset):
         # Binarize mask (in case of compression artifacts)
         mask = (mask > 127).astype(np.uint8)
 
+        # Optionally load junction heatmap
+        junction_heatmap = None
+        if self.has_junction_heatmaps:
+            junc_path = self.root / "junction_heatmaps" / f"{tile_id}.png"
+            if junc_path.exists():
+                junction_heatmap = np.array(Image.open(junc_path).convert("L")).astype(np.float32) / 255.0
+
         # Apply transforms
         if self.transform is not None:
-            transformed = self.transform(image=image, mask=mask)
+            transform_kwargs = {"image": image, "mask": mask}
+            if junction_heatmap is not None:
+                transform_kwargs["junction_heatmap"] = junction_heatmap
+            transformed = self.transform(**transform_kwargs)
             image = transformed["image"]
             mask = transformed["mask"]
+            if "junction_heatmap" in transformed:
+                junction_heatmap = transformed["junction_heatmap"]
 
-        return {
+        result = {
             "image": image,
             "mask": mask,
         }
+        if junction_heatmap is not None:
+            result["junction_heatmap"] = junction_heatmap
+
+        return result
 
 
 @register_dataset("wall_centerline")
@@ -92,6 +117,9 @@ class WallCenterlineDataModule(pl.LightningDataModule):
         self.size = cfg.dataset.size
         self.batch_size = cfg.dataset.batch_size
         self.num_workers = cfg.dataset.num_workers
+
+        # Detect if junction heatmaps are requested and available
+        self.junction_heatmap = bool(cfg.dataset.get("junction_heatmap", False))
 
         # Load metadata to get total count
         metadata_path = Path(self.root) / "tile_metadata.json"
@@ -115,10 +143,12 @@ class WallCenterlineDataModule(pl.LightningDataModule):
             train=True,
             sar=cfg.dataset.get("sar", False),
             aug=cfg.dataset.get("aug", {}),
+            junction_heatmap=self.junction_heatmap,
         )
         self.test_transform = build_transforms(
             size=self.size,
             train=False,
+            junction_heatmap=self.junction_heatmap,
         )
 
     def setup(self, stage: Optional[str] = None):
@@ -128,11 +158,13 @@ class WallCenterlineDataModule(pl.LightningDataModule):
                 root=self.root,
                 split_indices=self.splits["train"],
                 transform=self.train_transform,
+                junction_heatmap=self.junction_heatmap,
             )
             self.val_dataset = WallCenterlineDataset(
                 root=self.root,
                 split_indices=self.splits["val"],
                 transform=self.test_transform,
+                junction_heatmap=self.junction_heatmap,
             )
 
         if stage == "test" or stage is None:
@@ -140,6 +172,7 @@ class WallCenterlineDataModule(pl.LightningDataModule):
                 root=self.root,
                 split_indices=self.splits["test"],
                 transform=self.test_transform,
+                junction_heatmap=self.junction_heatmap,
             )
 
     def train_dataloader(self) -> DataLoader:
