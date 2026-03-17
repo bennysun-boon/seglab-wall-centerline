@@ -1,6 +1,7 @@
-# Full retrain: seg + centerline heads on 300-PDF dataset
+# Full retrain: seg + centerline heads on 300-PDF combined dataset
 # Train from SAM base checkpoint (no transfer from wall seg)
 # All weights in fp16-mixed from scratch — no precision mismatch
+# Per-polygon normalized DT labels (every wall ridge = 1.0)
 
 experiment: wall_centerline_full_retrain
 seed: 0
@@ -17,7 +18,7 @@ trainer:
   accelerator: gpu
   devices: 1
   precision: 16-mixed
-  accumulate_grad_batches: 4
+  accumulate_grad_batches: 4  # effective batch = 4*4 = 16
   log_every_n_steps: 10
   deterministic: warn
   gradient_clip_val: 1.0
@@ -28,12 +29,12 @@ trainer:
 dataset:
   type: wall_centerline
   name: wall_centerline
-  root: /home/bensunshine/ml-training-platform/wall_centerline/TopoLoRA-SAM/processed
+  root: /home/bensunshine/ml-training-platform/wall_centerline/TopoLoRA-SAM/processed_v2
   val_ratio: 0.15
   test_ratio: 0.15
   size: 1024
   sar: false
-  batch_size: 4
+  batch_size: 4  # OOM at 8 with full retrain (5.9M trainable params + optimizer states)
   num_workers: 4
   distance_transform: true
   force_train_pdfs:
@@ -189,12 +190,12 @@ loss:
   dice_weight: 1.0
   cldice_weight: 0.5
   boundary_weight: 0.0
-  centerline_weight: 10.0  # upweight to match seg loss scale (~10-20x smaller raw values)
+  centerline_weight: 3.0  # ~3x smaller raw values than seg loss with per-polygon norm
   centerline_bg_weight: 0.5
 
 optimizer:
   name: adamw
-  lr: 1e-4
+  lr: 1e-4  # standard for SAM LoRA from-scratch training
   weight_decay: 1e-4
 
 scheduler:
@@ -207,7 +208,7 @@ logging:
   mlflow_experiment: wall-centerline-full-retrain
   project: seglab
   entity: null
-  tags: ["full_retrain", "seg_centerline", "300pdf", "fp16_mixed", "from_scratch"]
+  tags: ["full_retrain", "seg_centerline", "300pdf", "fp16_mixed", "per_polygon_dt", "combined_dataset"]
 
 artifacts:
   save_test_preds: true
