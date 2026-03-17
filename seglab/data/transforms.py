@@ -17,6 +17,7 @@ def build_transforms(
     sar: bool = False,
     aug: Optional[Dict[str, Any]] = None,
     junction_heatmap: bool = False,
+    distance_transform: bool = False,
 ) -> A.Compose:
     aug = aug or {}
     if train:
@@ -33,10 +34,14 @@ def build_transforms(
             A.HorizontalFlip(p=aug.get("hflip", 0.5)),
             A.VerticalFlip(p=aug.get("vflip", 0.5)),
         ]
+        if aug.get("rotate90_p", 0.0) > 0:
+            tfs.append(A.RandomRotate90(p=aug["rotate90_p"]))
         if not sar:
             tfs.append(A.ColorJitter(p=aug.get("color_jitter_p", 0.2)))
         if aug.get("gauss_noise_p", 0.0) > 0:
             tfs.append(A.GaussNoise(p=aug["gauss_noise_p"]))
+        if aug.get("gauss_blur_p", 0.0) > 0:
+            tfs.append(A.GaussianBlur(blur_limit=(3, 5), p=aug["gauss_blur_p"]))
         tfs += [
             A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
             ToTensorV2(),
@@ -51,5 +56,7 @@ def build_transforms(
     additional_targets = {}
     if junction_heatmap:
         additional_targets["junction_heatmap"] = "mask"
+    if distance_transform:
+        additional_targets["distance_transform"] = "mask"
 
     return A.Compose(tfs, additional_targets=additional_targets)

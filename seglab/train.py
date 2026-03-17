@@ -127,42 +127,86 @@ def build_dataloaders(cfg: DictConfig) -> Tuple[DataLoader, DataLoader, DataLoad
             metadata = json.load(f)
         tiles = metadata["tiles"]
 
-        # Create train/val/test splits by PDF (prevents data leakage from overlapping tiles)
-        # All tiles from the same PDF will be in the same split
-        splits = make_split_indices_by_group(
-            tiles,
-            cfg.seed,
-            group_key="source_pdf",
-            val_ratio=cfg.dataset.get("val_ratio", 0.15),
-            test_ratio=cfg.dataset.get("test_ratio", 0.15),
-            cache_path=cache_dir / "splits" / f"wall_centerline_by_pdf_seed{cfg.seed}.json",
-        )
-
-        # Print split information
-        if "_metadata" in splits:
-            meta = splits["_metadata"]
-            print(f"\n{'='*60}")
-            print(f"DATASET SPLITS (by PDF to prevent data leakage)")
-            print(f"{'='*60}")
-            print(f"Total PDFs: {meta['total_groups']}")
-            print(f"  Train: {meta['train_groups']} PDFs ({meta['train_tiles']} tiles)")
-            print(f"  Val:   {meta['val_groups']} PDFs ({meta['val_tiles']} tiles)")
-            print(f"  Test:  {meta['test_groups']} PDFs ({meta['test_tiles']} tiles)")
-            print(f"{'='*60}\n")
-
         junction_heatmap = bool(cfg.dataset.get("junction_heatmap", False))
-        if junction_heatmap:
+        distance_transform = bool(cfg.dataset.get("distance_transform", False))
+        if junction_heatmap or distance_transform:
             tf_train = build_transforms(size=size, train=True, sar=cfg.dataset.get("sar", False),
-                                        aug=cfg.dataset.get("aug"), junction_heatmap=True)
+                                        aug=cfg.dataset.get("aug"), junction_heatmap=junction_heatmap,
+                                        distance_transform=distance_transform)
             tf_eval = build_transforms(size=size, train=False, sar=cfg.dataset.get("sar", False),
-                                       junction_heatmap=True)
+                                       junction_heatmap=junction_heatmap,
+                                       distance_transform=distance_transform)
+
+        # POC mode: train and validate on all tiles (no holdout)
+        val_on_train = bool(cfg.dataset.get("val_on_train", False))
+
+        if val_on_train:
+            all_indices = list(range(len(tiles)))
+            splits = {"train": all_indices, "val": all_indices, "test": []}
+            print(f"\n{'='*60}")
+            print(f"POC MODE (val_on_train): all {len(tiles)} tiles for train+val")
+            print(f"{'='*60}\n")
+        else:
+            # Create train/val/test splits by PDF (prevents data leakage from overlapping tiles)
+            # All tiles from the same PDF will be in the same split
+            force_train = list(cfg.dataset.get("force_train_pdfs", []))
+            splits = make_split_indices_by_group(
+                tiles,
+                cfg.seed,
+                group_key="source_pdf",
+                val_ratio=cfg.dataset.get("val_ratio", 0.15),
+                test_ratio=cfg.dataset.get("test_ratio", 0.15),
+                cache_path=cache_dir / "splits" / f"wall_centerline_by_pdf_seed{cfg.seed}.json",
+                force_train_groups=force_train if force_train else None,
+            )
+
+            # Print split information
+            if "_metadata" in splits:
+                meta = splits["_metadata"]
+                print(f"\n{'='*60}")
+                print(f"DATASET SPLITS (by PDF to prevent data leakage)")
+                print(f"{'='*60}")
+                print(f"Total PDFs: {meta['total_groups']}")
+                print(f"  Train: {meta['train_groups']} PDFs ({meta['train_tiles']} tiles)")
+                print(f"  Val:   {meta['val_groups']} PDFs ({meta['val_tiles']} tiles)")
+                print(f"  Test:  {meta['test_groups']} PDFs ({meta['test_tiles']} tiles)")
+                print(f"{'='*60}\n")
 
         train_ds = WallCenterlineDataset(cfg.dataset.root, splits["train"], tf_train,
-                                         junction_heatmap=junction_heatmap)
+                                         junction_heatmap=junction_heatmap,
+                                         distance_transform=distance_transform)
         val_ds = WallCenterlineDataset(cfg.dataset.root, splits["val"], tf_eval,
-                                       junction_heatmap=junction_heatmap)
-        test_ds = WallCenterlineDataset(cfg.dataset.root, splits["test"], tf_eval,
-                                        junction_heatmap=junction_heatmap)
+                                       junction_heatmap=junction_heatmap,
+                                       distance_transform=distance_transform)
+
+        # Test set: use separate test_root if provided (e.g., data_full for POC evaluation)
+        test_root = cfg.dataset.get("test_root", None)
+        if test_root:
+            test_metadata_path = Path(test_root) / "tile_metadata.json"
+            with open(test_metadata_path, "r") as f:
+                test_metadata = json.load(f)
+            test_tiles = test_metadata["tiles"]
+
+            # Use the test split from the external dataset
+            test_splits = make_split_indices_by_group(
+                test_tiles,
+                cfg.seed,
+                group_key="source_pdf",
+                val_ratio=cfg.dataset.get("test_root_val_ratio", 0.15),
+                test_ratio=cfg.dataset.get("test_root_test_ratio", 0.15),
+                cache_path=cache_dir / "splits" / f"wall_centerline_test_root_seed{cfg.seed}.json",
+            )
+            print(f"Test set from external root: {test_root}")
+            if "_metadata" in test_splits:
+                meta = test_splits["_metadata"]
+                print(f"  Test: {meta['test_groups']} PDFs ({meta['test_tiles']} tiles)")
+            test_ds = WallCenterlineDataset(test_root, test_splits["test"], tf_eval,
+                                             junction_heatmap=junction_heatmap,
+                                             distance_transform=distance_transform)
+        else:
+            test_ds = WallCenterlineDataset(cfg.dataset.root, splits["test"], tf_eval,
+                                            junction_heatmap=junction_heatmap,
+                                            distance_transform=distance_transform)
     else:
         raise ValueError(f"Unknown dataset type: {ds_type}")
 
@@ -294,33 +338,49 @@ def run_experiment(cfg: DictConfig, tag: Optional[str] = None) -> Path:
         except Exception as e:
             print(f"[warn] wandb logging requested but unavailable: {e}")
 
-    # Use junction_dice for monitoring when junction head is active and seg is frozen
+    # Choose monitoring metric based on which head is actively training
     has_junction = cfg.model.get("junction_head", {}).get("enabled", False)
+    has_centerline = cfg.model.get("centerline_head", {}).get("enabled", False)
     freeze_existing = cfg.get("freeze_existing", False)
-    if has_junction and freeze_existing:
-        monitor_metric = "val/junction_dice"
-        ckpt_filename = "{epoch}-{val/junction_dice:.4f}"
-    else:
-        monitor_metric = "val/dice"
-        ckpt_filename = "{epoch}-{val/dice:.4f}"
+
+    # Allow explicit override from config
+    monitor_metric = cfg.trainer.get("monitor", None)
+    monitor_mode = cfg.trainer.get("monitor_mode", None)
+
+    if monitor_metric is None:
+        if has_centerline and freeze_existing:
+            monitor_metric = "val/centerline_mae"
+            monitor_mode = "min"
+        elif has_junction and freeze_existing:
+            monitor_metric = "val/junction_dice"
+            monitor_mode = "max"
+        else:
+            monitor_metric = "val/dice"
+            monitor_mode = "max"
+    if monitor_mode is None:
+        monitor_mode = "max"
+
+    ckpt_metric_name = monitor_metric.replace("/", "_")
+    ckpt_filename = "{epoch}-{" + monitor_metric + ":.4f}"
 
     checkpoint_cb = ModelCheckpoint(
         dirpath=str(ckpt_dir),
         monitor=monitor_metric,
-        mode="max",
+        mode=monitor_mode,
         save_top_k=1,
         filename=ckpt_filename,
     )
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
 
-    # Early stopping: stop if no improvement for N epochs
+    # Early stopping: stop if no improvement over min_delta for N epochs
     early_stop_patience = cfg.trainer.get("early_stop_patience", 5)
+    early_stop_min_delta = cfg.trainer.get("early_stop_min_delta", 0.001)
     early_stop_cb = EarlyStopping(
         monitor=monitor_metric,
         patience=early_stop_patience,
-        mode="max",
+        mode=monitor_mode,
         verbose=True,
-        min_delta=0.001,
+        min_delta=early_stop_min_delta,
     )
 
     # Custom progress bar for cleaner log files

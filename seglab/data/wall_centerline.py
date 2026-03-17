@@ -27,6 +27,7 @@ class WallCenterlineDataset(Dataset):
         split_indices: list[int],
         transform: Optional[Any] = None,
         junction_heatmap: bool = False,
+        distance_transform: bool = False,
     ):
         """
         Args:
@@ -34,6 +35,7 @@ class WallCenterlineDataset(Dataset):
             split_indices: List of tile indices for this split
             transform: Albumentations transform
             junction_heatmap: Whether to load junction heatmaps
+            distance_transform: Whether to load distance transform labels
         """
         self.root = Path(root)
         self.transform = transform
@@ -58,8 +60,19 @@ class WallCenterlineDataset(Dataset):
             and (self.root / "junction_heatmaps").is_dir()
         )
 
-        print(f"WallCenterlineDataset: {len(self.tiles)} tiles"
-              f"{', with junction heatmaps' if self.has_junction_heatmaps else ''}")
+        # Check if distance transform labels are available and requested
+        self.has_distance_transform = (
+            distance_transform
+            and (self.root / "distance_transforms").is_dir()
+        )
+
+        extras = []
+        if self.has_junction_heatmaps:
+            extras.append("junction heatmaps")
+        if self.has_distance_transform:
+            extras.append("distance transforms")
+        extras_str = f", with {', '.join(extras)}" if extras else ""
+        print(f"WallCenterlineDataset: {len(self.tiles)} tiles{extras_str}")
 
     def __len__(self) -> int:
         return len(self.tiles)
@@ -85,16 +98,27 @@ class WallCenterlineDataset(Dataset):
             if junc_path.exists():
                 junction_heatmap = np.array(Image.open(junc_path).convert("L")).astype(np.float32) / 255.0
 
+        # Optionally load distance transform
+        distance_transform = None
+        if self.has_distance_transform:
+            dt_path = self.root / "distance_transforms" / f"{tile_id}.png"
+            if dt_path.exists():
+                distance_transform = np.array(Image.open(dt_path).convert("L")).astype(np.float32) / 255.0
+
         # Apply transforms
         if self.transform is not None:
             transform_kwargs = {"image": image, "mask": mask}
             if junction_heatmap is not None:
                 transform_kwargs["junction_heatmap"] = junction_heatmap
+            if distance_transform is not None:
+                transform_kwargs["distance_transform"] = distance_transform
             transformed = self.transform(**transform_kwargs)
             image = transformed["image"]
             mask = transformed["mask"]
             if "junction_heatmap" in transformed:
                 junction_heatmap = transformed["junction_heatmap"]
+            if "distance_transform" in transformed:
+                distance_transform = transformed["distance_transform"]
 
         result = {
             "image": image,
@@ -102,6 +126,8 @@ class WallCenterlineDataset(Dataset):
         }
         if junction_heatmap is not None:
             result["junction_heatmap"] = junction_heatmap
+        if distance_transform is not None:
+            result["distance_transform"] = distance_transform
 
         return result
 
@@ -120,6 +146,7 @@ class WallCenterlineDataModule(pl.LightningDataModule):
 
         # Detect if junction heatmaps are requested and available
         self.junction_heatmap = bool(cfg.dataset.get("junction_heatmap", False))
+        self.distance_transform = bool(cfg.dataset.get("distance_transform", False))
 
         # Load metadata to get total count
         metadata_path = Path(self.root) / "tile_metadata.json"
@@ -131,12 +158,20 @@ class WallCenterlineDataModule(pl.LightningDataModule):
         cache_dir = Path(cfg.paths.cache_dir) / "splits"
         cache_dir.mkdir(parents=True, exist_ok=True)
 
-        self.splits = make_split_indices(
-            self.total_tiles,
-            cfg.seed,
-            val_ratio=cfg.dataset.get("val_ratio", 0.15),
-            cache_path=cache_dir / f"wall_centerline_seed{cfg.seed}.json",
-        )
+        # POC mode: train on all tiles, validate on same data (no holdout)
+        self.val_on_train = bool(cfg.dataset.get("val_on_train", False))
+
+        if self.val_on_train:
+            all_indices = list(range(self.total_tiles))
+            self.splits = {"train": all_indices, "val": all_indices, "test": []}
+            print(f"POC mode (val_on_train): all {self.total_tiles} tiles used for both train and val")
+        else:
+            self.splits = make_split_indices(
+                self.total_tiles,
+                cfg.seed,
+                val_ratio=cfg.dataset.get("val_ratio", 0.15),
+                cache_path=cache_dir / f"wall_centerline_seed{cfg.seed}.json",
+            )
 
         self.train_transform = build_transforms(
             size=self.size,
@@ -144,11 +179,13 @@ class WallCenterlineDataModule(pl.LightningDataModule):
             sar=cfg.dataset.get("sar", False),
             aug=cfg.dataset.get("aug", {}),
             junction_heatmap=self.junction_heatmap,
+            distance_transform=self.distance_transform,
         )
         self.test_transform = build_transforms(
             size=self.size,
             train=False,
             junction_heatmap=self.junction_heatmap,
+            distance_transform=self.distance_transform,
         )
 
     def setup(self, stage: Optional[str] = None):
@@ -159,12 +196,14 @@ class WallCenterlineDataModule(pl.LightningDataModule):
                 split_indices=self.splits["train"],
                 transform=self.train_transform,
                 junction_heatmap=self.junction_heatmap,
+                distance_transform=self.distance_transform,
             )
             self.val_dataset = WallCenterlineDataset(
                 root=self.root,
                 split_indices=self.splits["val"],
                 transform=self.test_transform,
                 junction_heatmap=self.junction_heatmap,
+                distance_transform=self.distance_transform,
             )
 
         if stage == "test" or stage is None:
@@ -173,6 +212,7 @@ class WallCenterlineDataModule(pl.LightningDataModule):
                 split_indices=self.splits["test"],
                 transform=self.test_transform,
                 junction_heatmap=self.junction_heatmap,
+                distance_transform=self.distance_transform,
             )
 
     def train_dataloader(self) -> DataLoader:

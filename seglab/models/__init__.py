@@ -31,16 +31,29 @@ class LitBinarySeg(pl.LightningModule):
         self.cfg = cfg
         self.save_hyperparameters(OmegaConf.to_container(cfg, resolve=True))  # type: ignore
 
-        # Detect if junction head is active
+        # Detect if auxiliary heads are active
         self._has_junction_head = (
             hasattr(net, "junction_head") and net.junction_head is not None
         )
+        self._has_centerline_head = (
+            hasattr(net, "centerline_head") and net.centerline_head is not None
+        )
 
         # Freeze existing params if configured (for transfer learning)
-        if getattr(cfg, "freeze_existing", False) and self._has_junction_head:
-            for name, param in net.named_parameters():
-                if "junction_head" not in name:
-                    param.requires_grad = False
+        # Only new head(s) and explicitly unfrozen layers remain trainable
+        if getattr(cfg, "freeze_existing", False):
+            trainable_keywords = []
+            if self._has_junction_head:
+                trainable_keywords.append("junction_head")
+            if self._has_centerline_head:
+                trainable_keywords.append("centerline_head")
+            # Allow config to unfreeze specific layers (e.g., output_upscaling)
+            unfreeze_keywords = list(getattr(cfg, "unfreeze_keywords", []))
+            trainable_keywords.extend(unfreeze_keywords)
+            if trainable_keywords:
+                for name, param in net.named_parameters():
+                    if not any(kw in name for kw in trainable_keywords):
+                        param.requires_grad = False
 
         self.train_meter = SegmentationMeter()
         self.val_meter = SegmentationMeter()
@@ -61,13 +74,14 @@ class LitBinarySeg(pl.LightningModule):
         self._worst_samples: List[Tuple[float, np.ndarray, np.ndarray, np.ndarray]] = []
         self._rng = np.random.default_rng(int(getattr(cfg, "seed", 0)))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, ...]:
         out = self.net(x)
-        if isinstance(out, (tuple, list)) and len(out) == 2 and self._has_junction_head:
-            seg_logits, junction_logits = out
-            if seg_logits.ndim == 3:
-                seg_logits = seg_logits.unsqueeze(1)
-            return seg_logits, junction_logits
+        if isinstance(out, (tuple, list)) and len(out) > 1:
+            # Multi-head: first element is always seg logits
+            results = list(out)
+            if results[0].ndim == 3:
+                results[0] = results[0].unsqueeze(1)
+            return tuple(results)
         # Backward compatible: single-head
         logits = out
         if isinstance(logits, (tuple, list)):
@@ -98,39 +112,92 @@ class LitBinarySeg(pl.LightningModule):
 
     def _compute_junction_loss(self, junction_logits: torch.Tensor,
                                junction_target: torch.Tensor) -> torch.Tensor:
-        """MSE + Dice loss on junction heatmap predictions."""
-        # junction_target: (B, H, W) float [0,1] -> (B, 1, H, W)
+        """Weighted BCE + Dice loss on junction heatmap predictions.
+
+        Weighted BCE upweights positive (junction) pixels to counter the extreme
+        class imbalance (~0.1% positive). Dice provides overlap-based optimization.
+        """
         target_f = junction_target.float()
         if target_f.ndim == 3:
             target_f = target_f.unsqueeze(1)
 
         pred = torch.sigmoid(junction_logits)
 
-        mse = F.mse_loss(pred, target_f)
+        # Weighted BCE: pos_weight upscales the gradient for positive pixels
+        pos_weight_val = getattr(self.cfg.loss, "junction_pos_weight", 50.0)
+        pos_weight = torch.tensor([pos_weight_val], device=junction_logits.device)
+        bce = F.binary_cross_entropy_with_logits(
+            junction_logits, target_f, pos_weight=pos_weight
+        )
+
         d = dice_loss(pred, target_f)
 
-        mse_w = getattr(self.cfg.loss, "junction_mse_weight", 1.0)
+        bce_w = getattr(self.cfg.loss, "junction_bce_weight", 1.0)
         dice_w = getattr(self.cfg.loss, "junction_dice_weight", 1.0)
 
-        return mse_w * mse + dice_w * d
+        return bce_w * bce + dice_w * d
+
+    def _compute_centerline_loss(self, centerline_pred: torch.Tensor,
+                                  centerline_target: torch.Tensor,
+                                  mask: torch.Tensor) -> torch.Tensor:
+        """Smooth-L1 regression loss on distance transform.
+
+        Two components:
+        1. Wall pixels: smooth-L1 between predicted and target distance values.
+           This teaches the model the distance field shape and ridge location.
+        2. Background pixels: penalize any nonzero predictions outside the mask.
+           This prevents the model from hallucinating distance outside walls.
+        """
+        target_f = centerline_target.float()
+        if target_f.ndim == 3:
+            target_f = target_f.unsqueeze(1)
+        mask_f = mask.float()
+        if mask_f.ndim == 3:
+            mask_f = mask_f.unsqueeze(1)
+
+        wall_mask = (mask_f > 0.5).float()
+        bg_mask = 1.0 - wall_mask
+
+        # Wall pixels: learn the distance field
+        n_wall = wall_mask.sum().clamp(min=1.0)
+        wall_loss = F.smooth_l1_loss(
+            centerline_pred * wall_mask, target_f * wall_mask, reduction="sum"
+        ) / n_wall
+
+        # Background pixels: push predictions to zero
+        n_bg = bg_mask.sum().clamp(min=1.0)
+        bg_loss = (centerline_pred * bg_mask).abs().sum() / n_bg
+
+        bg_weight = getattr(self.cfg.loss, "centerline_bg_weight", 0.5)
+        return wall_loss + bg_weight * bg_loss
 
     def _shared_step(self, batch: Dict[str, torch.Tensor], stage: str) -> torch.Tensor:
         x = batch["image"]
         y = batch["mask"]
         out = self(x)
 
-        # Dual-head: (seg_logits, junction_logits) when junction head is active
-        has_junction_target = "junction_heatmap" in batch
-        if isinstance(out, tuple) and self._has_junction_head:
-            seg_logits, junction_logits = out
+        # Unpack multi-head outputs based on which heads are active
+        junction_logits = None
+        centerline_pred = None
+        if isinstance(out, tuple):
+            seg_logits = out[0]
+            idx = 1
+            if self._has_junction_head:
+                junction_logits = out[idx]
+                idx += 1
+            if self._has_centerline_head:
+                centerline_pred = out[idx]
+                idx += 1
         else:
             seg_logits = out
-            junction_logits = None
 
-        # Segmentation loss (skip if existing params are frozen)
+        # Segmentation loss: compute if shared features are unfrozen (to preserve seg quality)
         freeze_existing = getattr(self.cfg, "freeze_existing", False)
-        if freeze_existing and self._has_junction_head:
-            seg_loss = torch.tensor(0.0, device=x.device)
+        has_aux = self._has_junction_head or self._has_centerline_head
+        has_unfreeze = len(list(getattr(self.cfg, "unfreeze_keywords", []))) > 0
+        if freeze_existing and has_aux and not has_unfreeze:
+            # Fully frozen: skip seg loss but keep on compute graph
+            seg_loss = 0.0 * seg_logits.sum()
         else:
             seg_loss = self._compute_seg_loss(seg_logits, y)
 
@@ -138,6 +205,7 @@ class LitBinarySeg(pl.LightningModule):
         self.log(f"{stage}/seg_loss", seg_loss, on_step=False, on_epoch=True)
 
         # Junction heatmap loss
+        has_junction_target = "junction_heatmap" in batch
         if junction_logits is not None and has_junction_target:
             junction_target = batch["junction_heatmap"]
             junction_loss = self._compute_junction_loss(junction_logits, junction_target)
@@ -155,6 +223,30 @@ class LitBinarySeg(pl.LightningModule):
                 union = pred.sum() + target_f.sum()
                 junc_dice = (2.0 * inter + 1e-6) / (union + 1e-6)
             self.log(f"{stage}/junction_dice", junc_dice, on_step=False, on_epoch=True, prog_bar=(stage == "val"))
+
+        # Centerline distance transform loss
+        has_centerline_target = "distance_transform" in batch
+        if centerline_pred is not None and has_centerline_target:
+            centerline_target = batch["distance_transform"]
+            centerline_loss = self._compute_centerline_loss(centerline_pred, centerline_target, y)
+            centerline_weight = getattr(self.cfg.loss, "centerline_weight", 1.0)
+            loss = loss + centerline_weight * centerline_loss
+            self.log(f"{stage}/centerline_loss", centerline_loss, on_step=False, on_epoch=True)
+
+            # Log centerline MAE on wall pixels for monitoring
+            with torch.no_grad():
+                target_f = centerline_target.float()
+                if target_f.ndim == 3:
+                    target_f = target_f.unsqueeze(1)
+                mask_f = y.float()
+                if mask_f.ndim == 3:
+                    mask_f = mask_f.unsqueeze(1)
+                wall_mask = (mask_f > 0.5)
+                if wall_mask.sum() > 0:
+                    mae = (centerline_pred[wall_mask] - target_f[wall_mask]).abs().mean()
+                else:
+                    mae = torch.tensor(0.0, device=x.device)
+            self.log(f"{stage}/centerline_mae", mae, on_step=False, on_epoch=True, prog_bar=(stage == "val"))
 
         probs = torch.sigmoid(seg_logits)
         meter = getattr(self, f"{stage}_meter")

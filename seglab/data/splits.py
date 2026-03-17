@@ -93,6 +93,7 @@ def make_split_indices_by_group(
     val_ratio: float = 0.15,
     test_ratio: float = 0.15,
     cache_path: str | Path | None = None,
+    force_train_groups: List[str] | None = None,
 ) -> Dict[str, List[int]]:
     """Return indices for train/val/test by grouping tiles (e.g., by source PDF).
 
@@ -106,6 +107,7 @@ def make_split_indices_by_group(
         val_ratio: Fraction of groups for validation (default: 0.15)
         test_ratio: Fraction of groups for test (default: 0.15)
         cache_path: Optional path to cache the split indices
+        force_train_groups: List of group IDs that must be in the train split
 
     Returns:
         Dictionary with keys 'train', 'val', 'test' containing tile index lists
@@ -136,20 +138,28 @@ def make_split_indices_by_group(
 
     # Get sorted group IDs for reproducibility
     group_ids = sorted(groups.keys())
-    n_groups = len(group_ids)
 
-    # Shuffle groups
+    # Separate forced-train groups from the rest
+    force_train_set = set(force_train_groups or [])
+    forced_groups = [g for g in group_ids if g in force_train_set]
+    remaining_groups = [g for g in group_ids if g not in force_train_set]
+    n_remaining = len(remaining_groups)
+
+    if forced_groups:
+        print(f"  Force-train groups: {len(forced_groups)} (excluded from val/test)")
+
+    # Shuffle remaining groups
     rng = np.random.RandomState(seed)
-    perm_groups = rng.permutation(group_ids).tolist()
+    perm_groups = rng.permutation(remaining_groups).tolist()
 
-    # Calculate split sizes (by number of groups)
-    val_n = int(n_groups * val_ratio)
-    test_n = int(n_groups * test_ratio)
+    # Calculate split sizes from remaining groups only
+    val_n = int(n_remaining * val_ratio)
+    test_n = int(n_remaining * test_ratio)
 
-    # Split groups
+    # Split remaining groups into val/test/train, then add forced groups to train
     val_groups = perm_groups[:val_n]
     test_groups = perm_groups[val_n:val_n + test_n]
-    train_groups = perm_groups[val_n + test_n:]
+    train_groups = perm_groups[val_n + test_n:] + forced_groups
 
     # Expand groups to tile indices
     train_idx = []
@@ -166,6 +176,7 @@ def make_split_indices_by_group(
     splits = {"train": train_idx, "val": val_idx, "test": test_idx}
 
     # Add metadata about the split
+    n_groups = len(group_ids)
     splits["_metadata"] = {
         "total_tiles": n,
         "total_groups": n_groups,
@@ -175,6 +186,7 @@ def make_split_indices_by_group(
         "train_tiles": len(train_idx),
         "val_tiles": len(val_idx),
         "test_tiles": len(test_idx),
+        "forced_train_groups": len(forced_groups),
     }
 
     if cache_path:
