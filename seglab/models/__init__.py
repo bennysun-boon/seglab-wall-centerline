@@ -508,9 +508,48 @@ class LitBinarySeg(pl.LightningModule):
             opt = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=wd)
 
         sched_cfg = self.cfg.get("scheduler", {})
-        if sched_cfg.get("name", "none") == "cosine":
+        sched_name = sched_cfg.get("name", "none")
+
+        if sched_name == "warmup_flat":
+            # Linear warmup from warmup_start_lr → lr over warmup_epochs,
+            # then constant lr for remaining epochs.
+            warmup_epochs = int(sched_cfg.get("warmup_epochs", 4))
+            warmup_start = float(sched_cfg.get("warmup_start_lr", 1e-6))
+            # LinearLR multiplies the base lr by start_factor → end_factor
+            warmup = torch.optim.lr_scheduler.LinearLR(
+                opt,
+                start_factor=warmup_start / lr,
+                end_factor=1.0,
+                total_iters=warmup_epochs,
+            )
+            flat = torch.optim.lr_scheduler.ConstantLR(opt, factor=1.0, total_iters=self.cfg.trainer.max_epochs)
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                opt, schedulers=[warmup, flat], milestones=[warmup_epochs]
+            )
+            return {"optimizer": opt, "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
+
+        if sched_name == "warmup_cosine":
+            # Linear warmup then cosine annealing.
+            warmup_epochs = int(sched_cfg.get("warmup_epochs", 4))
+            warmup_start = float(sched_cfg.get("warmup_start_lr", 1e-6))
+            warmup = torch.optim.lr_scheduler.LinearLR(
+                opt,
+                start_factor=warmup_start / lr,
+                end_factor=1.0,
+                total_iters=warmup_epochs,
+            )
+            cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt, T_max=self.cfg.trainer.max_epochs - warmup_epochs
+            )
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                opt, schedulers=[warmup, cosine], milestones=[warmup_epochs]
+            )
+            return {"optimizer": opt, "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
+
+        if sched_name == "cosine":
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=self.cfg.trainer.max_epochs)
             return {"optimizer": opt, "lr_scheduler": scheduler}
+
         return opt
 
 

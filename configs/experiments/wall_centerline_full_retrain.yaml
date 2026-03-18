@@ -1,13 +1,12 @@
-# Full retrain: seg + centerline heads on 300-PDF combined dataset
-# bf16-mixed for A100 — fp32 dynamic range without fp16 overflow (NaN-resistant)
-# Sobel gradient loss (masked to wall pixels) to sharpen DT ridges
+# Full retrain from scratch: seg + centerline heads on 300-PDF combined dataset
+# bf16-mixed (A100 native — fp32 dynamic range, NaN-resistant for Sobel backprop)
+# Sobel gradient loss masked to wall pixels — sharpens ridge peaks
 # Per-polygon normalized DT labels (every wall ridge = 1.0)
+# Warmup scheduler: 1e-6 → 1e-4 over 4 epochs, then flat 1e-4
 
 experiment: wall_centerline_full_retrain
 seed: 0
-
-# Resume from epoch 10 (best dice=0.834, MAE=0.194) of the bg_weight=5.0 run
-transfer_ckpt: /home/bensunshine/ml-training-platform/wall_centerline/TopoLoRA-SAM/Seglab/checkpoints/wall_centerline_full_retrain/wall_centerline/sam_topolora/seed0/epoch=10-val/centerline_mae=0.1937.ckpt
+# No transfer_ckpt — training from SAM base (clean slate, no checkpoint shock)
 
 paths:
   results_dir: results
@@ -199,11 +198,13 @@ loss:
 
 optimizer:
   name: adamw
-  lr: 5e-5  # halved from 1e-4 — fine-tuning phase after 15 effective epochs
+  lr: 1e-4  # peak LR after warmup — standard for SAM LoRA from-scratch training
   weight_decay: 1e-4
 
 scheduler:
-  name: cosine
+  name: warmup_flat       # linear warmup then constant LR
+  warmup_epochs: 4        # 1e-6 → 1e-4 over 4 epochs
+  warmup_start_lr: 1e-6   # gives optimizer time to establish stable momentum
 
 logging:
   wandb: false
@@ -212,7 +213,7 @@ logging:
   mlflow_experiment: wall-centerline-full-retrain
   project: seglab
   entity: null
-  tags: ["full_retrain", "seg_centerline", "300pdf", "bf16_mixed", "per_polygon_dt", "sobel_loss", "bg_weight_2", "lr_5e5"]
+  tags: ["full_retrain", "from_scratch", "seg_centerline", "300pdf", "bf16_mixed", "per_polygon_dt", "sobel_loss", "bg_weight_2", "warmup_flat_lr1e4"]
 
 artifacts:
   save_test_preds: true
