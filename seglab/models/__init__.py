@@ -137,16 +137,30 @@ class LitBinarySeg(pl.LightningModule):
 
         return bce_w * bce + dice_w * d
 
+    @staticmethod
+    def _sobel_gradients(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute Sobel gradients (Gx, Gy) of a (B, 1, H, W) tensor."""
+        sobel_x = torch.tensor(
+            [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=x.dtype, device=x.device
+        ).view(1, 1, 3, 3)
+        sobel_y = torch.tensor(
+            [[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=x.dtype, device=x.device
+        ).view(1, 1, 3, 3)
+        gx = F.conv2d(x, sobel_x, padding=1)
+        gy = F.conv2d(x, sobel_y, padding=1)
+        return gx, gy
+
     def _compute_centerline_loss(self, centerline_pred: torch.Tensor,
                                   centerline_target: torch.Tensor,
                                   mask: torch.Tensor) -> torch.Tensor:
-        """Smooth-L1 regression loss on distance transform.
+        """Smooth-L1 regression loss + masked Sobel gradient loss on distance transform.
 
-        Two components:
+        Three components:
         1. Wall pixels: smooth-L1 between predicted and target distance values.
-           This teaches the model the distance field shape and ridge location.
-        2. Background pixels: penalize any nonzero predictions outside the mask.
-           This prevents the model from hallucinating distance outside walls.
+        2. Background pixels: L1 penalty pushing predictions to zero.
+        3. Sobel gradient loss (wall pixels only): penalizes flat ridge predictions
+           by matching the gradient (slope) of the predicted DT to the target DT.
+           Masked to wall pixels so high-pass Sobel doesn't amplify background noise.
         """
         target_f = centerline_target.float()
         if target_f.ndim == 3:
@@ -158,18 +172,33 @@ class LitBinarySeg(pl.LightningModule):
         wall_mask = (mask_f > 0.5).float()
         bg_mask = 1.0 - wall_mask
 
-        # Wall pixels: learn the distance field
+        # 1. Wall pixels: smooth-L1 on distance values
         n_wall = wall_mask.sum().clamp(min=1.0)
         wall_loss = F.smooth_l1_loss(
             centerline_pred * wall_mask, target_f * wall_mask, reduction="sum"
         ) / n_wall
 
-        # Background pixels: push predictions to zero
+        # 2. Background pixels: push predictions to zero
         n_bg = bg_mask.sum().clamp(min=1.0)
         bg_loss = (centerline_pred * bg_mask).abs().sum() / n_bg
 
-        bg_weight = getattr(self.cfg.loss, "centerline_bg_weight", 0.5)
-        return wall_loss + bg_weight * bg_loss
+        bg_weight = getattr(self.cfg.loss, "centerline_bg_weight", 2.0)
+        sobel_weight = getattr(self.cfg.loss, "centerline_sobel_weight", 0.0)
+
+        loss = wall_loss + bg_weight * bg_loss
+
+        # 3. Sobel gradient loss — masked strictly to wall pixels
+        if sobel_weight > 0.0:
+            pred_gx, pred_gy = self._sobel_gradients(centerline_pred)
+            tgt_gx, tgt_gy = self._sobel_gradients(target_f)
+            # Mask both gradient maps to wall pixels only
+            sobel_loss = (
+                ((pred_gx - tgt_gx) * wall_mask).abs().sum() +
+                ((pred_gy - tgt_gy) * wall_mask).abs().sum()
+            ) / (2.0 * n_wall)
+            loss = loss + sobel_weight * sobel_loss
+
+        return loss
 
     def _shared_step(self, batch: Dict[str, torch.Tensor], stage: str) -> torch.Tensor:
         x = batch["image"]

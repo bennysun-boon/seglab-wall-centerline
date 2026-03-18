@@ -1,13 +1,13 @@
 # Full retrain: seg + centerline heads on 300-PDF combined dataset
-# Train from SAM base checkpoint (no transfer from wall seg)
-# All weights in fp16-mixed from scratch — no precision mismatch
+# bf16-mixed for A100 — fp32 dynamic range without fp16 overflow (NaN-resistant)
+# Sobel gradient loss (masked to wall pixels) to sharpen DT ridges
 # Per-polygon normalized DT labels (every wall ridge = 1.0)
 
 experiment: wall_centerline_full_retrain
 seed: 0
 
-# Resume from epoch 3 (dice=0.799, MAE=0.1636)
-transfer_ckpt: /home/bensunshine/ml-training-platform/wall_centerline/TopoLoRA-SAM/Seglab/checkpoints/wall_centerline_full_retrain/wall_centerline/sam_topolora/seed0/epoch=3-val/centerline_mae=0.1636.ckpt
+# Resume from epoch 10 (best dice=0.834, MAE=0.194) of the bg_weight=5.0 run
+transfer_ckpt: /home/bensunshine/ml-training-platform/wall_centerline/TopoLoRA-SAM/Seglab/checkpoints/wall_centerline_full_retrain/wall_centerline/sam_topolora/seed0/epoch=10-val/centerline_mae=0.1937.ckpt
 
 paths:
   results_dir: results
@@ -20,12 +20,12 @@ trainer:
   max_epochs: 50
   accelerator: gpu
   devices: 1
-  precision: 16-mixed
+  precision: bf16-mixed  # A100 native — fp32 dynamic range, 16-bit speed, NaN-resistant
   accumulate_grad_batches: 4  # effective batch = 4*4 = 16
   log_every_n_steps: 10
   deterministic: warn
-  gradient_clip_val: 1.0
-  early_stop_patience: 8
+  gradient_clip_val: 0.5  # tighter — Sobel loss creates derivative-of-derivative spikes
+  early_stop_patience: 10  # more patience at lower LR
   monitor: val/centerline_mae
   monitor_mode: min
 
@@ -193,12 +193,13 @@ loss:
   dice_weight: 1.0
   cldice_weight: 0.5
   boundary_weight: 0.0
-  centerline_weight: 3.0  # ~3x smaller raw values than seg loss with per-polygon norm
-  centerline_bg_weight: 5.0  # increased from 0.5 — suppress background activations
+  centerline_weight: 3.0
+  centerline_bg_weight: 2.0   # 5.0 caused NaN; 2.0 suppresses bg without overflowing
+  centerline_sobel_weight: 0.1  # masked Sobel gradient loss (wall pixels only) to sharpen ridges
 
 optimizer:
   name: adamw
-  lr: 1e-4  # standard for SAM LoRA from-scratch training
+  lr: 5e-5  # halved from 1e-4 — fine-tuning phase after 15 effective epochs
   weight_decay: 1e-4
 
 scheduler:
@@ -211,7 +212,7 @@ logging:
   mlflow_experiment: wall-centerline-full-retrain
   project: seglab
   entity: null
-  tags: ["full_retrain", "seg_centerline", "300pdf", "fp16_mixed", "per_polygon_dt", "combined_dataset"]
+  tags: ["full_retrain", "seg_centerline", "300pdf", "bf16_mixed", "per_polygon_dt", "sobel_loss", "bg_weight_2", "lr_5e5"]
 
 artifacts:
   save_test_preds: true
