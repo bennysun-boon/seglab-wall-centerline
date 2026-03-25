@@ -19,6 +19,7 @@ from seglab.models.sam_peft.topo_losses import (
     dice_loss,
     cldice_loss,
     boundary_loss,
+    BorderEDTLoss,
 )
 
 
@@ -38,6 +39,9 @@ class LitBinarySeg(pl.LightningModule):
         self._has_centerline_head = (
             hasattr(net, "centerline_head") and net.centerline_head is not None
         )
+        self._has_border_edt_head = (
+            hasattr(net, "border_edt_head") and net.border_edt_head is not None
+        )
 
         # Freeze existing params if configured (for transfer learning)
         # Only new head(s) and explicitly unfrozen layers remain trainable
@@ -50,10 +54,21 @@ class LitBinarySeg(pl.LightningModule):
             # Allow config to unfreeze specific layers (e.g., output_upscaling)
             unfreeze_keywords = list(getattr(cfg, "unfreeze_keywords", []))
             trainable_keywords.extend(unfreeze_keywords)
+            if self._has_border_edt_head:
+                trainable_keywords.append("border_edt_head")
             if trainable_keywords:
                 for name, param in net.named_parameters():
                     if not any(kw in name for kw in trainable_keywords):
                         param.requires_grad = False
+
+        # BorderEDTLoss owns Sobel buffers — instantiated here so Lightning moves
+        # them to the correct device when the module is moved.
+        band_threshold = getattr(getattr(cfg, "loss", {}), "border_edt_band_threshold", 0.98)
+        sobel_weight   = getattr(getattr(cfg, "loss", {}), "border_edt_sobel_weight",   0.1)
+        self.border_edt_criterion = BorderEDTLoss(
+            band_threshold=band_threshold,
+            sobel_weight=sobel_weight,
+        )
 
         self.train_meter = SegmentationMeter()
         self.val_meter = SegmentationMeter()
@@ -200,6 +215,16 @@ class LitBinarySeg(pl.LightningModule):
 
         return loss
 
+    def _compute_border_edt_loss(
+        self,
+        edt_pred: torch.Tensor,
+        edt_target: torch.Tensor,
+    ) -> torch.Tensor:
+        """Delegate to the BorderEDTLoss module (Sobel buffers on correct device)."""
+        if edt_target.ndim == 3:
+            edt_target = edt_target.unsqueeze(1)
+        return self.border_edt_criterion(edt_pred, edt_target)
+
     def _shared_step(self, batch: Dict[str, torch.Tensor], stage: str) -> torch.Tensor:
         x = batch["image"]
         y = batch["mask"]
@@ -208,6 +233,7 @@ class LitBinarySeg(pl.LightningModule):
         # Unpack multi-head outputs based on which heads are active
         junction_logits = None
         centerline_pred = None
+        border_edt_pred = None
         if isinstance(out, tuple):
             seg_logits = out[0]
             idx = 1
@@ -216,6 +242,9 @@ class LitBinarySeg(pl.LightningModule):
                 idx += 1
             if self._has_centerline_head:
                 centerline_pred = out[idx]
+                idx += 1
+            if self._has_border_edt_head:
+                border_edt_pred = out[idx]
                 idx += 1
         else:
             seg_logits = out
@@ -252,6 +281,27 @@ class LitBinarySeg(pl.LightningModule):
                 union = pred.sum() + target_f.sum()
                 junc_dice = (2.0 * inter + 1e-6) / (union + 1e-6)
             self.log(f"{stage}/junction_dice", junc_dice, on_step=False, on_epoch=True, prog_bar=(stage == "val"))
+
+        # Border EDT loss (paving)
+        has_border_edt_target = "border_edt" in batch
+        if border_edt_pred is not None and has_border_edt_target:
+            border_edt_target = batch["border_edt"]
+            edt_loss = self._compute_border_edt_loss(border_edt_pred, border_edt_target)
+            border_edt_weight = getattr(self.cfg.loss, "border_edt_weight", 3.0)
+            loss = loss + border_edt_weight * edt_loss
+            self.log(f"{stage}/border_edt_loss", edt_loss, on_step=False, on_epoch=True)
+
+            with torch.no_grad():
+                target_f = border_edt_target.float()
+                if target_f.ndim == 3:
+                    target_f = target_f.unsqueeze(1)
+                band_mask = target_f < self.border_edt_criterion.band_threshold
+                if band_mask.sum() > 0:
+                    mae = (border_edt_pred[band_mask] - target_f[band_mask]).abs().mean()
+                else:
+                    mae = torch.tensor(0.0, device=x.device)
+            self.log(f"{stage}/border_edt_mae", mae, on_step=False, on_epoch=True,
+                     prog_bar=(stage == "val"))
 
         # Centerline distance transform loss
         has_centerline_target = "distance_transform" in batch
@@ -306,9 +356,9 @@ class LitBinarySeg(pl.LightningModule):
         max_qual = int(getattr(getattr(self.cfg, "artifacts", {}), "max_qual", 8))
         save_preds = bool(getattr(getattr(self.cfg, "artifacts", {}), "save_test_preds", True))
 
-        probs_cpu = probs.detach().cpu().numpy()
-        y_cpu = y.detach().cpu().numpy().astype(np.uint8)
-        x_cpu = x.detach().cpu().numpy()
+        probs_cpu = probs.detach().cpu().float().numpy()
+        y_cpu = y.detach().cpu().float().numpy().astype(np.uint8)
+        x_cpu = x.detach().cpu().float().numpy()
         pred_bin = (probs_cpu > 0.5).astype(np.uint8)
 
         if save_preds and pred_dir is not None:

@@ -63,3 +63,74 @@ def boundary_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -
     tgt_e = F.conv2d(target, lap, padding=1).abs()
     return dice_loss(pred_e, tgt_e, eps=eps)
 
+
+class BorderEDTLoss(nn.Module):
+    """Band-masked smooth-L1 + optional Sobel gradient loss for border EDT regression.
+
+    The EDT target encodes unsigned distance to the nearest paving boundary,
+    normalised to [0, 1] and truncated (pixels beyond the truncation radius are
+    clamped to 1.0).  Supervising on the clamped plateau provides no useful
+    gradient signal, so a band mask excludes those pixels.
+
+    Sobel kernels are registered as persistent buffers so they are created once,
+    live on the correct device, and survive dtype changes under AMP without
+    requiring dtype=pred.dtype casts on every forward call.
+
+    Args:
+        band_threshold:  Pixels with target < this are supervised.  Default 0.98
+                         excludes the clamped plateau at max truncation.
+        sobel_weight:    Weight for Sobel gradient loss.  Penalises flat trough
+                         predictions by matching the spatial gradient slope —
+                         producing a sharper boundary trough and more precise
+                         threshold-based border recovery at inference.
+    """
+
+    def __init__(self, band_threshold: float = 0.98, sobel_weight: float = 0.0):
+        super().__init__()
+        self.band_threshold = band_threshold
+        self.sobel_weight   = sobel_weight
+
+        kx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+        ky = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+        self.register_buffer("sobel_x", kx)
+        self.register_buffer("sobel_y", ky)
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if target.ndim == 3:
+            target = target.unsqueeze(1)
+
+        band_mask = (target < self.band_threshold).float()
+        n_band    = band_mask.sum().clamp(min=1.0)
+
+        loss = F.smooth_l1_loss(
+            pred * band_mask, target * band_mask, reduction="sum"
+        ) / n_band
+
+        if self.sobel_weight > 0.0:
+            # Cast buffers to pred's dtype — handles bf16/fp16 AMP forward passes.
+            sx = self.sobel_x.to(dtype=pred.dtype)
+            sy = self.sobel_y.to(dtype=pred.dtype)
+            pred_gx = F.conv2d(pred,   sx, padding=1)
+            pred_gy = F.conv2d(pred,   sy, padding=1)
+            tgt_gx  = F.conv2d(target, sx, padding=1)
+            tgt_gy  = F.conv2d(target, sy, padding=1)
+            sobel_loss = (
+                ((pred_gx - tgt_gx) * band_mask).abs().sum() +
+                ((pred_gy - tgt_gy) * band_mask).abs().sum()
+            ) / (2.0 * n_band)
+            loss = loss + self.sobel_weight * sobel_loss
+
+        return loss
+
+
+def border_edt_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    band_threshold: float = 0.98,
+    sobel_weight: float = 0.0,
+) -> torch.Tensor:
+    """Functional wrapper around BorderEDTLoss for one-off / test calls."""
+    fn = BorderEDTLoss(band_threshold=band_threshold, sobel_weight=sobel_weight)
+    fn = fn.to(device=pred.device)
+    return fn(pred, target)
+

@@ -1,0 +1,108 @@
+# Paving region segmentation — full retrain from SAM base
+# Dual-head: seg (BCE + Dice + clDice) + BorderEDTHead (band-masked smooth-L1 + Sobel)
+# Splits by source PDF to prevent tile-overlap leakage between train/val/test
+# Hyperparams ported from wall_centerline_full_retrain.yaml (NaN-safe values)
+
+experiment: paving_full_retrain
+seed: 0
+
+paths:
+  results_dir: results
+  checkpoints_dir: checkpoints
+  figures_dir: figures
+  tables_dir: tables
+  cache_dir: cache
+
+trainer:
+  max_epochs: 50
+  accelerator: gpu
+  devices: 1
+  precision: bf16-mixed        # A100 native — NaN-resistant for Sobel backprop
+  accumulate_grad_batches: 8   # effective batch = 2*8 = 16
+  log_every_n_steps: 100
+  deterministic: warn
+  gradient_clip_val: 0.5       # Sobel loss creates derivative-of-derivative spikes
+  early_stop_patience: 10
+  monitor: val/border_edt_mae
+  monitor_mode: min
+
+dataset:
+  type: paving
+  name: paving
+  root: /home/bensunshine/ml-training-platform/paving/TopoLoRA-SAM/processed
+  val_ratio: 0.15
+  test_ratio: 0.15
+  size: 1024
+  sar: false
+  batch_size: 2
+  num_workers: 8
+  border_edt: true
+  aug:
+    scale: [0.75, 1.25]        # wider than walls — paving regions are large, no fine-width sensitivity
+    hflip: 0.5
+    vflip: 0.5
+    rotate90_p: 0.5            # civil site plans have no canonical orientation
+    color_jitter_p: 0.35       # bridges raster/vector appearance gap (scanned vs CAD)
+    gauss_blur_p: 0.2          # simulates raster scan softness
+    gauss_noise_p: 0.1         # simulates scan grain on raster half of dataset
+
+model:
+  name: sam_topolora
+  sam_type: vit_b
+  sam_checkpoint: /home/bensunshine/ml-training-platform/wall_centerline/TopoLoRA-SAM/Seglab/checkpoints/sam_vit_b_01ec64.pth
+  train_mask_decoder: true
+  lora:
+    enabled: true
+    r: 16
+    alpha: 32              # scale = alpha/r = 2.0 (same as before)
+    dropout: 0.05
+    target_keywords: ["mlp", "qkv", "proj"]  # all 48 linear layers; fc1/fc2 don't exist in SAM ViT-B
+  adapter:
+    enabled: true
+    hidden_dim: 256
+    kernel_size: 3
+  prompt:
+    learnable: false
+  border_edt_head:
+    enabled: true
+    hidden_dim: 256
+
+loss:
+  # Seg head
+  bce_weight: 1.0
+  dice_weight: 1.0
+  cldice_weight: 0.5           # topology-aware overlap loss on filled regions
+  boundary_weight: 0.0         # disabled — Laplacian boundary loss unstable at bf16
+
+  # BorderEDTHead
+  border_edt_weight: 3.0
+  border_edt_band_threshold: 0.98  # exclude clamped plateau at max truncation
+  border_edt_sobel_weight: 0.1     # sharpens near-boundary gradient trough
+  # Note: edt_truncation=25px matches 72 DPI preprocessing (50px@150dpi ≈ 25px@72dpi)
+
+optimizer:
+  name: adamw
+  lr: 1e-4
+  weight_decay: 1e-4
+
+scheduler:
+  name: warmup_flat
+  warmup_epochs: 4
+  warmup_start_lr: 1e-6
+
+logging:
+  wandb: false
+  mlflow: true
+  mlflow_validate: true
+  mlflow_experiment: paving-full-retrain
+  project: seglab
+  entity: null
+  tags: ["paving", "full_retrain", "border_edt", "dual_head", "bf16_mixed", "warmup_flat"]
+
+artifacts:
+  save_test_preds: true
+  save_figures: false
+  sample_pixels: 200000
+  sample_pixels_per_image: 5000
+  max_qual: 8
+  bf_tol: 1

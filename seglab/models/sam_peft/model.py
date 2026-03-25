@@ -15,6 +15,39 @@ from seglab.models.sam_peft.sam_loader import load_sam
 from seglab.utils.registry import register_model
 
 
+class BorderEDTHead(nn.Module):
+    """Predict unsigned border EDT from mask decoder's upscaled features.
+
+    Outputs the distance of every pixel to the nearest paving boundary,
+    normalised to [0, 1].  Boundary pixels → 0; deep interior / far background
+    → 1 (clamped at the truncation radius set during preprocessing).
+
+    Same feature tap point and architecture as CenterlineDistHead (32ch @ 256×256
+    from mask decoder output_upscaling), but supervision is band-masked rather
+    than wall-masked — see border_edt_loss in topo_losses.py.
+    """
+
+    def __init__(self, in_channels: int = 32, hidden_dim: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_dim, 3, padding=1),
+            nn.BatchNorm2d(hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1),
+            nn.BatchNorm2d(hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim // 2, 3, padding=1),
+            nn.BatchNorm2d(hidden_dim // 2),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim // 2, 1, 1),
+        )
+
+    def forward(self, upscaled_embedding: torch.Tensor, output_size: tuple[int, int]) -> torch.Tensor:
+        x = self.net(upscaled_embedding)
+        x = F.interpolate(x, size=output_size, mode="bilinear", align_corners=False)
+        return torch.sigmoid(x)
+
+
 class CenterlineDistHead(nn.Module):
     """Predict distance transform regression from mask decoder's upscaled features.
 
@@ -143,6 +176,15 @@ class SAMPEFTNet(nn.Module):
                 hidden_dim=cl_cfg.get("hidden_dim", 256),
             )
 
+        # Optional border EDT head for paving region boundary regression
+        self.border_edt_head: Optional[BorderEDTHead] = None
+        edt_cfg = cfg.model.get("border_edt_head", {})
+        if edt_cfg.get("enabled", False):
+            self.border_edt_head = BorderEDTHead(
+                in_channels=32,
+                hidden_dim=edt_cfg.get("hidden_dim", 256),
+            )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, ...]:
         # SAM expects inputs normalized with its own pixel_mean/std and padded to img_size.
         # Our datasets use ImageNet normalization; invert it back to [0, 255] RGB first.
@@ -164,7 +206,7 @@ class SAMPEFTNet(nn.Module):
             points=None, boxes=None, masks=None
         )
 
-        has_aux = self.junction_head is not None or self.centerline_head is not None
+        has_aux = self.junction_head is not None or self.centerline_head is not None or self.border_edt_head is not None
         if has_aux:
             # Run mask decoder internals manually to access upscaled embeddings
             low_res_masks, upscaled_embedding = self._decode_with_upscaled(
@@ -177,6 +219,8 @@ class SAMPEFTNet(nn.Module):
                 results.append(self.junction_head(upscaled_embedding, output_size=x.shape[-2:]))
             if self.centerline_head is not None:
                 results.append(self.centerline_head(upscaled_embedding, output_size=x.shape[-2:]))
+            if self.border_edt_head is not None:
+                results.append(self.border_edt_head(upscaled_embedding, output_size=x.shape[-2:]))
             return tuple(results)
 
         low_res_masks, _ = self.sam.mask_decoder(

@@ -207,6 +207,38 @@ def build_dataloaders(cfg: DictConfig) -> Tuple[DataLoader, DataLoader, DataLoad
             test_ds = WallCenterlineDataset(cfg.dataset.root, splits["test"], tf_eval,
                                             junction_heatmap=junction_heatmap,
                                             distance_transform=distance_transform)
+    elif ds_type == "paving":
+        from seglab.data.paving import PavingDataset
+
+        metadata_path = Path(cfg.dataset.root) / "tile_metadata.json"
+        with open(metadata_path) as f:
+            tiles = json.load(f)["tiles"]
+
+        border_edt = bool(cfg.dataset.get("border_edt", True))
+        tf_train = build_transforms(size=size, train=True, aug=cfg.dataset.get("aug"),
+                                    border_edt=border_edt)
+        tf_eval  = build_transforms(size=size, train=False, border_edt=border_edt)
+
+        splits = make_split_indices_by_group(
+            tiles, cfg.seed,
+            group_key="source_pdf",
+            val_ratio=cfg.dataset.get("val_ratio", 0.15),
+            test_ratio=cfg.dataset.get("test_ratio", 0.15),
+            cache_path=cache_dir / "splits" / f"paving_by_pdf_seed{cfg.seed}.json",
+        )
+        if "_metadata" in splits:
+            meta = splits["_metadata"]
+            print(f"\n{'='*60}")
+            print(f"PAVING SPLITS (by PDF)")
+            print(f"  Train: {meta['train_groups']} PDFs ({meta['train_tiles']} tiles)")
+            print(f"  Val:   {meta['val_groups']} PDFs ({meta['val_tiles']} tiles)")
+            print(f"  Test:  {meta['test_groups']} PDFs ({meta['test_tiles']} tiles)")
+            print(f"{'='*60}\n")
+
+        train_ds = PavingDataset(cfg.dataset.root, splits["train"], tf_train, border_edt=border_edt)
+        val_ds   = PavingDataset(cfg.dataset.root, splits["val"],   tf_eval,  border_edt=border_edt)
+        test_ds  = PavingDataset(cfg.dataset.root, splits["test"],  tf_eval,  border_edt=border_edt)
+
     else:
         raise ValueError(f"Unknown dataset type: {ds_type}")
 
@@ -407,6 +439,7 @@ def run_experiment(cfg: DictConfig, tag: Optional[str] = None) -> Path:
         log_every_n_steps=cfg.trainer.log_every_n_steps,
         deterministic=cfg.trainer.get("deterministic", True),
         gradient_clip_val=cfg.trainer.get("gradient_clip_val", 0.0),
+        limit_train_batches=cfg.trainer.get("limit_train_batches", 1.0),
         callbacks=callbacks,
         logger=loggers,
         default_root_dir=str(run_dir),

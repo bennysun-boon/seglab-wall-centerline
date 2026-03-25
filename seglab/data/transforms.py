@@ -18,6 +18,7 @@ def build_transforms(
     aug: Optional[Dict[str, Any]] = None,
     junction_heatmap: bool = False,
     distance_transform: bool = False,
+    border_edt: bool = False,
 ) -> A.Compose:
     aug = aug or {}
     if train:
@@ -58,5 +59,7 @@ def build_transforms(
         additional_targets["junction_heatmap"] = "mask"
     if distance_transform:
         additional_targets["distance_transform"] = "mask"
+    if border_edt:
+        additional_targets["border_edt"] = "mask"
 
     return A.Compose(tfs, additional_targets=additional_targets)
