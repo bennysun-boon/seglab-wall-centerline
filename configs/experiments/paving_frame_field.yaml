@@ -1,0 +1,127 @@
+# Frame Field Head — transfer learning from joint seg+EDT+poly checkpoint
+# Replaces BorderEDTHead + PavingPolyHead with a single FrameFieldHead.
+# Predicts: edge map (binary boundary) + frame field (4ch directional field).
+# Post-processing: skeleton → ASM optimization → corner detection → polygon graph.
+#
+# Monitor: val/ff_angle_error (mean angular deviation at edge pixels, degrees)
+# NOT val/edge_f1 — edge detection is trivial on a frozen backbone and plateaus
+# in 2-3 epochs. ff_angle_error is the true signal for directional quality.
+
+experiment: paving_frame_field
+seed: 0
+
+freeze_existing: false
+
+paths:
+  results_dir: results
+  checkpoints_dir: checkpoints
+  figures_dir: figures
+  tables_dir: tables
+  cache_dir: cache
+
+trainer:
+  max_epochs: 80
+  accelerator: gpu
+  devices: 1
+  precision: bf16-mixed
+  accumulate_grad_batches: 8    # effective batch = 2*8 = 16
+  log_every_n_steps: 50
+  deterministic: warn
+  gradient_clip_val: 1.0
+  early_stop_patience: 5
+  monitor: val/ff_angle_error
+  monitor_mode: min
+
+dataset:
+  type: paving
+  name: paving
+  root: /home/bensunshine/ml-training-platform/paving/TopoLoRA-SAM/processed
+  val_ratio: 0.15
+  test_ratio: 0.15
+  size: 1024
+  sar: false
+  batch_size: 2
+  num_workers: 16
+  prefetch_factor: 8
+  border_edt: false             # EDT head disabled — frame field subsumes it
+  frame_field: true             # on-the-fly edge + theta target generation
+  annotations_path: /home/bensunshine/ml-training-platform/wall_centerline/TopoLoRA-SAM/data_full/annotations.json
+  ff_thickness: 2               # edge rasterisation thickness in pixels
+  aug:
+    scale: [0.75, 1.25]
+    hflip: 0.5
+    vflip: 0.5
+    rotate90_p: 0.5             # NOTE: theta is NOT rotation-aware yet — see transforms.py
+    color_jitter_p: 0.35
+    gauss_blur_p: 0.2
+    gauss_noise_p: 0.1
+
+model:
+  name: sam_topolora
+  sam_type: vit_b
+  sam_checkpoint: /home/bensunshine/ml-training-platform/paving/TopoLoRA-SAM/Seglab/checkpoints/sam_vit_b_01ec64.pth
+  train_mask_decoder: true
+  lora:
+    enabled: true
+    r: 8
+    alpha: 16
+    dropout: 0.05
+    target_keywords: ["mlp", "qkv", "proj"]
+  adapter:
+    enabled: true
+    hidden_dim: 256
+    kernel_size: 3
+  prompt:
+    learnable: false
+  border_edt_head:
+    enabled: false              # replaced by frame_field_head
+  poly_head:
+    enabled: false              # replaced by frame_field_head
+  frame_field_head:
+    enabled: true
+    hidden_dim: 256             # ~260K params (edge_branch + ff_branch)
+
+loss:
+  # Segmentation head — trains jointly with frame field
+  bce_weight: 1.0
+  dice_weight: 1.0
+  cldice_weight: 0.0
+  boundary_weight: 0.0
+  border_edt_weight: 0.0   # EDT head disabled
+  vmap_weight: 0.0          # poly head disabled
+  voff_weight: 0.0          # poly head disabled
+
+  # Frame field losses (weights from FFL paper ratios)
+  frame_field_weight: 1.0       # outer multiplier on combined FF loss
+  ff_edge_weight: 0.5           # BCE + Dice on edge branch
+  ff_align_weight: 1.0          # primary: align field to GT tangent
+  ff_align90_weight: 0.2        # prevent line-field collapse
+  ff_smooth_weight: 0.005       # Dirichlet smoothness regularisation
+  ff_int_coupling_weight: 0.2   # couple field to seg gradient
+  ff_int_edge_weight: 0.2       # couple edge to seg gradient magnitude
+
+optimizer:
+  name: adamw
+  lr: 5e-4          # high LR — only new head trains
+  weight_decay: 1e-4
+
+scheduler:
+  name: cosine
+  T_max: 15
+
+logging:
+  wandb: false
+  mlflow: true
+  mlflow_validate: true
+  mlflow_experiment: paving-frame-field
+  project: seglab
+  entity: null
+  tags: ["paving", "frame_field", "transfer", "ffl", "frozen_backbone"]
+
+artifacts:
+  save_test_preds: false
+  save_figures: false
+  sample_pixels: 100000
+  sample_pixels_per_image: 2000
+  max_qual: 4
+  bf_tol: 1

@@ -6,6 +6,8 @@
 experiment: paving_full_retrain
 seed: 0
 
+ckpt_path: /home/bensunshine/ml-training-platform/paving/TopoLoRA-SAM/Seglab/checkpoints/paving_full_retrain/paving/sam_topolora/seed0/epoch=7-val/border_edt_mae=0.0961.ckpt
+
 paths:
   results_dir: results
   checkpoints_dir: checkpoints
@@ -49,7 +51,7 @@ dataset:
 model:
   name: sam_topolora
   sam_type: vit_b
-  sam_checkpoint: /home/bensunshine/ml-training-platform/wall_centerline/TopoLoRA-SAM/Seglab/checkpoints/sam_vit_b_01ec64.pth
+  sam_checkpoint: /home/bensunshine/ml-training-platform/paving/TopoLoRA-SAM/Seglab/checkpoints/sam_vit_b_01ec64.pth
   train_mask_decoder: true
   lora:
     enabled: true
@@ -66,6 +68,9 @@ model:
   border_edt_head:
     enabled: true
     hidden_dim: 256
+  poly_head:
+    enabled: true
+    hidden_dim: 128
 
 loss:
   # Seg head
@@ -79,6 +84,12 @@ loss:
   border_edt_band_threshold: 0.98  # exclude clamped plateau at max truncation
   border_edt_sobel_weight: 0.1     # sharpens near-boundary gradient trough
   # Note: edt_truncation=25px matches 72 DPI preprocessing (50px@150dpi ≈ 25px@72dpi)
+
+  # PavingPolyHead — trained jointly from scratch (SAMPolyBuild approach)
+  vmap_weight: 1.25
+  vmap_focal_alpha: 0.95           # vertices are ~0.01% of pixels
+  vmap_focal_gamma: 2.0
+  voff_weight: 5.0
 
 optimizer:
   name: adamw
@@ -97,7 +108,7 @@ logging:
   mlflow_experiment: paving-full-retrain
   project: seglab
   entity: null
-  tags: ["paving", "full_retrain", "border_edt", "dual_head", "bf16_mixed", "warmup_flat"]
+  tags: ["paving", "full_retrain", "border_edt", "joint_heads", "bf16_mixed", "warmup_flat"]
 
 artifacts:
   save_test_preds: true

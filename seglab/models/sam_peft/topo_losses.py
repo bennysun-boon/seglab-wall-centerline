@@ -95,19 +95,30 @@ class BorderEDTLoss(nn.Module):
         self.register_buffer("sobel_x", kx)
         self.register_buffer("sobel_y", ky)
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, pred: torch.Tensor, target: torch.Tensor,
+                seg_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         if target.ndim == 3:
             target = target.unsqueeze(1)
 
+        # Band mask: exclude saturated plateau (far background / deep interior)
         band_mask = (target < self.band_threshold).float()
-        n_band    = band_mask.sum().clamp(min=1.0)
+
+        # Seg mask: EDT only meaningful inside or near paving regions.
+        # Use a dilated version so boundary pixels just outside the mask are included.
+        if seg_mask is not None:
+            if seg_mask.ndim == 3:
+                seg_mask = seg_mask.unsqueeze(1)
+            # Dilate by ~5px to include pixels just outside the boundary
+            seg_dilated = F.max_pool2d(seg_mask.float(), kernel_size=11, stride=1, padding=5)
+            band_mask = band_mask * seg_dilated
+
+        n_band = band_mask.sum().clamp(min=1.0)
 
         loss = F.smooth_l1_loss(
             pred * band_mask, target * band_mask, reduction="sum"
         ) / n_band
 
         if self.sobel_weight > 0.0:
-            # Cast buffers to pred's dtype — handles bf16/fp16 AMP forward passes.
             sx = self.sobel_x.to(dtype=pred.dtype)
             sy = self.sobel_y.to(dtype=pred.dtype)
             pred_gx = F.conv2d(pred,   sx, padding=1)
@@ -133,4 +144,220 @@ def border_edt_loss(
     fn = BorderEDTLoss(band_threshold=band_threshold, sobel_weight=sobel_weight)
     fn = fn.to(device=pred.device)
     return fn(pred, target)
+
+
+# ── Polygon head losses (vmap + voff) ─────────────────────────────────────────
+
+def vmap_loss(pred: torch.Tensor, target: torch.Tensor,
+              seg_mask: Optional[torch.Tensor] = None,
+              focal_weight: float = 10.0, dice_weight: float = 0.5,
+              alpha: float = 0.25, gamma: float = 2.0) -> torch.Tensor:
+    """FocalDice loss for the vertex heatmap head.
+
+    Vertices occupy ~0.1% of pixels — standard BCE collapses to predicting zeros.
+    Focal loss emphasises hard positives; dice provides overlap-level supervision.
+
+    Args:
+        pred:         (B, 1, H, W) raw logits
+        target:       (B, 1, H, W) Gaussian heatmap targets in [0, 1]
+        seg_mask:     (B, 1, H, W) binary seg mask — restrict supervision to
+                      inside/near paving regions (vertices can't be in background)
+        focal_weight: multiplier for focal term (default 10 from SAMPolyBuild)
+        dice_weight:  multiplier for dice term
+        alpha:        focal positive class weight
+        gamma:        focal focusing parameter
+    """
+    if target.ndim == 3:
+        target = target.unsqueeze(1)
+
+    if seg_mask is not None:
+        if seg_mask.ndim == 3:
+            seg_mask = seg_mask.unsqueeze(1)
+        seg_mask = seg_mask.float()
+
+    # Focal loss with soft targets
+    prob = torch.sigmoid(pred)
+    ce   = F.binary_cross_entropy_with_logits(pred, target, reduction="none")
+    pt   = prob * target + (1 - prob) * (1 - target)
+    focal_factor = alpha * target + (1 - alpha) * (1 - target)
+    focal = focal_factor * (1 - pt) ** gamma * ce
+
+    if seg_mask is not None:
+        n = seg_mask.sum().clamp(min=1.0)
+        l_focal = (focal * seg_mask).sum() / n
+    else:
+        l_focal = focal.mean()
+
+    # Dice loss restricted to seg mask
+    if seg_mask is not None:
+        l_dice = dice_loss(prob * seg_mask, target * seg_mask)
+    else:
+        l_dice = dice_loss(prob, target)
+
+    return focal_weight * l_focal + dice_weight * l_dice
+
+
+# ── Frame Field losses (Girard et al., CVPR 2021) ─────────────────────────────
+
+def _ff_poly_abs_sq(ff: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+    """Compute |f(e^{iθ}; c0, c2)|² using real trig arithmetic.
+
+    The polynomial f(z) = z⁴ + c₂z² + c₀ with z = e^{iθ} expands to:
+        real = cos4θ + c2_re·cos2θ - c2_im·sin2θ + c0_re
+        imag = sin4θ + c2_re·sin2θ + c2_im·cos2θ + c0_im
+        |f|² = real² + imag²
+
+    Works natively in bf16/fp16/fp32 — no torch.complex or upcasting needed.
+
+    ff:    (B, 4, H, W) — [c0_re, c0_im, c2_re, c2_im], tanh-bounded
+    theta: (B, 1, H, W) — angle in [0, π)
+    Returns: (B, 1, H, W) non-negative scalar per pixel
+    """
+    c0_re, c0_im = ff[:, 0:1], ff[:, 1:2]
+    c2_re, c2_im = ff[:, 2:3], ff[:, 3:4]
+
+    cos2 = torch.cos(2.0 * theta)
+    sin2 = torch.sin(2.0 * theta)
+    cos4 = torch.cos(4.0 * theta)
+    sin4 = torch.sin(4.0 * theta)
+
+    real = cos4 + c2_re * cos2 - c2_im * sin2 + c0_re
+    imag = sin4 + c2_re * sin2 + c2_im * cos2 + c0_im
+
+    return real ** 2 + imag ** 2
+
+
+def ff_edge_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """BCE + Dice on binary edge predictions.
+
+    Edges are ~5-10% of pixels — no focal loss needed (unlike vmap).
+
+    Args:
+        pred:   (B, 1, H, W) raw logits from edge_branch
+        target: (B, 1, H, W) or (B, H, W) float binary edge map in [0, 1]
+    """
+    if target.ndim == 3:
+        target = target.unsqueeze(1)
+    bce  = F.binary_cross_entropy_with_logits(pred, target)
+    d    = dice_loss(torch.sigmoid(pred), target)
+    return bce + d
+
+
+def ff_align_loss(ff: torch.Tensor, theta: torch.Tensor,
+                  edge_mask: torch.Tensor) -> torch.Tensor:
+    """Align frame field to GT tangent directions at edge pixels.
+
+    Evaluates |f(e^{iθ}; c0, c2)|² at each edge pixel, where
+    f(z) = z^4 + c2*z^2 + c0 should → 0 when z aligns with the edge tangent.
+
+    Args:
+        ff:        (B, 4, H, W) — [Re(c0), Im(c0), Re(c2), Im(c2)], tanh output
+        theta:     (B, 1, H, W) or (B, H, W) GT tangent angle in [0, π)
+        edge_mask: (B, 1, H, W) float, 1 at edge pixels
+    """
+    if theta.ndim == 3:
+        theta = theta.unsqueeze(1)
+    if edge_mask.ndim == 3:
+        edge_mask = edge_mask.unsqueeze(1)
+
+    poly_sq = _ff_poly_abs_sq(ff, theta)
+    n = edge_mask.sum().clamp(min=1.0)
+    return (edge_mask * poly_sq).sum() / n
+
+
+def ff_align90_loss(ff: torch.Tensor, theta: torch.Tensor,
+                    edge_mask: torch.Tensor) -> torch.Tensor:
+    """Align frame field to the perpendicular direction at edge pixels.
+
+    Prevents the field from collapsing to a single-direction (line) field
+    by also aligning to the direction 90° off the tangent.
+    """
+    if theta.ndim == 3:
+        theta = theta.unsqueeze(1)
+    if edge_mask.ndim == 3:
+        edge_mask = edge_mask.unsqueeze(1)
+
+    theta_perp = theta + (torch.pi / 2)
+    poly_sq = _ff_poly_abs_sq(ff, theta_perp)
+    n = edge_mask.sum().clamp(min=1.0)
+    return (edge_mask * poly_sq).sum() / n
+
+
+def ff_smooth_loss(ff: torch.Tensor) -> torch.Tensor:
+    """Dirichlet energy — penalises spatial gradients in c0 and c2.
+
+    Encourages the frame field to be spatially smooth across the image,
+    which prevents noisy frame field predictions in flat regions.
+    """
+    def _grad_mag_sq(t: torch.Tensor) -> torch.Tensor:
+        dx = t[:, :, :, 1:] - t[:, :, :, :-1]
+        dy = t[:, :, 1:, :] - t[:, :, :-1, :]
+        return (dx ** 2).mean() + (dy ** 2).mean()
+
+    return _grad_mag_sq(ff[:, :2]) + _grad_mag_sq(ff[:, 2:])  # c0 + c2
+
+
+def ff_interior_coupling_loss(ff: torch.Tensor,
+                               seg_logits: torch.Tensor) -> torch.Tensor:
+    """Couple frame field direction to seg gradient (Lint_align from FFL).
+
+    The spatial gradient of the interior seg map points perpendicular to
+    boundaries — this provides free supervision for the frame field without
+    needing GT theta at non-edge pixels. Gradients backprop only through ff.
+
+    Args:
+        ff:         (B, 4, H, W) frame field coefficients
+        seg_logits: (B, 1, H, W) seg logits — detached, used as signal source only
+    """
+    seg_prob = torch.sigmoid(seg_logits.detach())
+
+    gx = F.pad(seg_prob[:, :, :, 1:] - seg_prob[:, :, :, :-1], (0, 1, 0, 0))
+    gy = F.pad(seg_prob[:, :, 1:, :] - seg_prob[:, :, :-1, :], (0, 0, 0, 1))
+    grad_mag = (gx ** 2 + gy ** 2).sqrt()
+    grad_dir = torch.atan2(gy, gx)
+
+    poly_sq = _ff_poly_abs_sq(ff, grad_dir)
+    return (grad_mag * poly_sq).mean()
+
+
+def ff_edge_coupling_loss(edge_pred: torch.Tensor,
+                           seg_logits: torch.Tensor) -> torch.Tensor:
+    """Couple edge prediction to seg gradient magnitude (Lint_edge from FFL).
+
+    Edge prediction should match where the interior map has strong gradients.
+    Weighted by max(1 - seg_prob, grad_mag) to focus on boundary + background.
+    """
+    seg_prob = torch.sigmoid(seg_logits.detach())
+    gx = F.pad(seg_prob[:, :, :, 1:] - seg_prob[:, :, :, :-1], (0, 1, 0, 0))
+    gy = F.pad(seg_prob[:, :, 1:, :] - seg_prob[:, :, :-1, :], (0, 0, 0, 1))
+    grad_mag  = (gx ** 2 + gy ** 2).sqrt()
+    edge_prob = torch.sigmoid(edge_pred)
+    weight    = torch.max(1.0 - seg_prob, grad_mag)
+    return (weight * (grad_mag - edge_prob).abs()).mean()
+
+
+def voff_loss(pred: torch.Tensor, target: torch.Tensor,
+              vmask: torch.Tensor) -> torch.Tensor:
+    """Masked L1 loss for the vertex offset head.
+
+    Supervises only pixels within the vmap supervision radius (vmask > 0).
+    Inverse-frequency weights balance the contribution of vertex-dense tiles
+    vs sparse tiles.
+
+    Args:
+        pred:   (B, 2, H, W) raw logits — sigmoid maps to offset in [-1, 1]
+        target: (B, 2, H, W) normalised offsets in [-1, 1] (dx/radius, dy/radius)
+        vmask:  (B, 1, H, W) or (B, H, W) float supervision mask (1 = supervised)
+    """
+    if vmask.ndim == 3:
+        vmask = vmask.unsqueeze(1)  # (B, 1, H, W)
+
+    pred_off = torch.sigmoid(pred) * 2.0 - 1.0   # remap [0,1] → [-1,1]
+    loss = (pred_off - target).abs()
+
+    # Inverse-frequency weighting per sample so sparse tiles aren't drowned out
+    w = vmask.mean(dim=[-2, -1], keepdim=True).clamp(min=1e-6)
+    loss = loss * vmask / w
+
+    return loss.mean()
 

@@ -20,6 +20,14 @@ from seglab.models.sam_peft.topo_losses import (
     cldice_loss,
     boundary_loss,
     BorderEDTLoss,
+    vmap_loss,
+    voff_loss,
+    ff_edge_loss,
+    ff_align_loss,
+    ff_align90_loss,
+    ff_smooth_loss,
+    ff_interior_coupling_loss,
+    ff_edge_coupling_loss,
 )
 
 
@@ -42,6 +50,12 @@ class LitBinarySeg(pl.LightningModule):
         self._has_border_edt_head = (
             hasattr(net, "border_edt_head") and net.border_edt_head is not None
         )
+        self._has_poly_head = (
+            hasattr(net, "poly_head") and net.poly_head is not None
+        )
+        self._has_frame_field_head = (
+            hasattr(net, "frame_field_head") and net.frame_field_head is not None
+        )
 
         # Freeze existing params if configured (for transfer learning)
         # Only new head(s) and explicitly unfrozen layers remain trainable
@@ -56,6 +70,10 @@ class LitBinarySeg(pl.LightningModule):
             trainable_keywords.extend(unfreeze_keywords)
             if self._has_border_edt_head:
                 trainable_keywords.append("border_edt_head")
+            if self._has_poly_head:
+                trainable_keywords.append("poly_head")
+            if self._has_frame_field_head:
+                trainable_keywords.append("frame_field_head")
             if trainable_keywords:
                 for name, param in net.named_parameters():
                     if not any(kw in name for kw in trainable_keywords):
@@ -63,12 +81,15 @@ class LitBinarySeg(pl.LightningModule):
 
         # BorderEDTLoss owns Sobel buffers — instantiated here so Lightning moves
         # them to the correct device when the module is moved.
-        band_threshold = getattr(getattr(cfg, "loss", {}), "border_edt_band_threshold", 0.98)
-        sobel_weight   = getattr(getattr(cfg, "loss", {}), "border_edt_sobel_weight",   0.1)
-        self.border_edt_criterion = BorderEDTLoss(
-            band_threshold=band_threshold,
-            sobel_weight=sobel_weight,
-        )
+        if self._has_border_edt_head:
+            band_threshold = getattr(getattr(cfg, "loss", {}), "border_edt_band_threshold", 0.98)
+            sobel_weight   = getattr(getattr(cfg, "loss", {}), "border_edt_sobel_weight",   0.1)
+            self.border_edt_criterion = BorderEDTLoss(
+                band_threshold=band_threshold,
+                sobel_weight=sobel_weight,
+            )
+        else:
+            self.border_edt_criterion = None
 
         self.train_meter = SegmentationMeter()
         self.val_meter = SegmentationMeter()
@@ -88,6 +109,14 @@ class LitBinarySeg(pl.LightningModule):
         self._best_samples: List[Tuple[float, np.ndarray, np.ndarray, np.ndarray]] = []
         self._worst_samples: List[Tuple[float, np.ndarray, np.ndarray, np.ndarray]] = []
         self._rng = np.random.default_rng(int(getattr(cfg, "seed", 0)))
+
+    def setup(self, stage: str) -> None:
+        # Compile the encoder here — after Lightning has loaded transfer weights
+        # (doing it in __init__ causes key mismatches with torch.compile's _orig_mod prefix)
+        net = self.net
+        if getattr(net, "_compile_encoder", False) and hasattr(torch, "compile"):
+            if not hasattr(net.sam.image_encoder, "_orig_mod"):  # not already compiled
+                net.sam.image_encoder = torch.compile(net.sam.image_encoder)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, ...]:
         out = self.net(x)
@@ -219,11 +248,69 @@ class LitBinarySeg(pl.LightningModule):
         self,
         edt_pred: torch.Tensor,
         edt_target: torch.Tensor,
+        seg_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Delegate to the BorderEDTLoss module (Sobel buffers on correct device)."""
         if edt_target.ndim == 3:
             edt_target = edt_target.unsqueeze(1)
-        return self.border_edt_criterion(edt_pred, edt_target)
+        return self.border_edt_criterion(edt_pred, edt_target, seg_mask=seg_mask)  # type: ignore[union-attr]
+
+    def _compute_poly_loss(
+        self,
+        poly_pred: dict,
+        vmap_target: torch.Tensor,
+        voff_target: torch.Tensor,
+        vmask: torch.Tensor,
+        seg_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """FocalDice vmap + masked-L1 voff losses."""
+        if vmap_target.ndim == 3:
+            vmap_target = vmap_target.unsqueeze(1)
+        if voff_target.ndim == 3:
+            voff_target = voff_target.unsqueeze(1)
+
+        vmap_w      = getattr(self.cfg.loss, "vmap_weight", 1.25)
+        voff_w      = getattr(self.cfg.loss, "voff_weight", 5.0)
+        focal_alpha = getattr(self.cfg.loss, "vmap_focal_alpha", 0.95)
+        focal_gamma = getattr(self.cfg.loss, "vmap_focal_gamma", 2.0)
+
+        l_vmap = vmap_loss(poly_pred["vmap"], vmap_target, seg_mask=seg_mask,
+                           alpha=focal_alpha, gamma=focal_gamma)
+        l_voff = voff_loss(poly_pred["voff"], voff_target, vmask)
+        return vmap_w * l_vmap + voff_w * l_voff
+
+    def _compute_ff_loss(
+        self,
+        ff_pred: dict,
+        edge_target: torch.Tensor,
+        theta_target: torch.Tensor,
+        seg_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Combine 6 frame field losses with configurable weights."""
+        if edge_target.ndim == 3:
+            edge_target = edge_target.unsqueeze(1)
+        if theta_target.ndim == 3:
+            theta_target = theta_target.unsqueeze(1)
+
+        edge_pred = ff_pred["edge"]
+        ff_coeff  = ff_pred["ff"]
+
+        w_edge     = getattr(self.cfg.loss, "ff_edge_weight",         0.5)
+        w_align    = getattr(self.cfg.loss, "ff_align_weight",        1.0)
+        w_align90  = getattr(self.cfg.loss, "ff_align90_weight",      0.2)
+        w_smooth   = getattr(self.cfg.loss, "ff_smooth_weight",       0.005)
+        w_int_ff   = getattr(self.cfg.loss, "ff_int_coupling_weight", 0.2)
+        w_int_edge = getattr(self.cfg.loss, "ff_int_edge_weight",     0.2)
+
+        l_edge      = ff_edge_loss(edge_pred, edge_target)
+        l_align     = ff_align_loss(ff_coeff, theta_target, edge_target)
+        l_align90   = ff_align90_loss(ff_coeff, theta_target, edge_target)
+        l_smooth    = ff_smooth_loss(ff_coeff)
+        l_int_ff    = ff_interior_coupling_loss(ff_coeff, seg_logits)
+        l_int_edge  = ff_edge_coupling_loss(edge_pred, seg_logits)
+
+        return (w_edge * l_edge + w_align * l_align + w_align90 * l_align90
+                + w_smooth * l_smooth + w_int_ff * l_int_ff + w_int_edge * l_int_edge)
 
     def _shared_step(self, batch: Dict[str, torch.Tensor], stage: str) -> torch.Tensor:
         x = batch["image"]
@@ -231,21 +318,24 @@ class LitBinarySeg(pl.LightningModule):
         out = self(x)
 
         # Unpack multi-head outputs based on which heads are active
-        junction_logits = None
-        centerline_pred = None
-        border_edt_pred = None
+        junction_logits  = None
+        centerline_pred  = None
+        border_edt_pred  = None
+        poly_pred        = None
+        frame_field_pred = None
         if isinstance(out, tuple):
             seg_logits = out[0]
             idx = 1
             if self._has_junction_head:
-                junction_logits = out[idx]
-                idx += 1
+                junction_logits = out[idx]; idx += 1
             if self._has_centerline_head:
-                centerline_pred = out[idx]
-                idx += 1
+                centerline_pred = out[idx]; idx += 1
             if self._has_border_edt_head:
-                border_edt_pred = out[idx]
-                idx += 1
+                border_edt_pred = out[idx]; idx += 1
+            if self._has_poly_head:
+                poly_pred = out[idx]; idx += 1
+            if self._has_frame_field_head:
+                frame_field_pred = out[idx]; idx += 1
         else:
             seg_logits = out
 
@@ -282,11 +372,14 @@ class LitBinarySeg(pl.LightningModule):
                 junc_dice = (2.0 * inter + 1e-6) / (union + 1e-6)
             self.log(f"{stage}/junction_dice", junc_dice, on_step=False, on_epoch=True, prog_bar=(stage == "val"))
 
-        # Border EDT loss (paving)
+        # Border EDT loss (paving) — restricted to inside/near seg mask
         has_border_edt_target = "border_edt" in batch
         if border_edt_pred is not None and has_border_edt_target:
             border_edt_target = batch["border_edt"]
-            edt_loss = self._compute_border_edt_loss(border_edt_pred, border_edt_target)
+            seg_prob = torch.sigmoid(seg_logits).detach()
+            edt_loss = self._compute_border_edt_loss(
+                border_edt_pred, border_edt_target, seg_mask=seg_prob
+            )
             border_edt_weight = getattr(self.cfg.loss, "border_edt_weight", 3.0)
             loss = loss + border_edt_weight * edt_loss
             self.log(f"{stage}/border_edt_loss", edt_loss, on_step=False, on_epoch=True)
@@ -295,13 +388,80 @@ class LitBinarySeg(pl.LightningModule):
                 target_f = border_edt_target.float()
                 if target_f.ndim == 3:
                     target_f = target_f.unsqueeze(1)
-                band_mask = target_f < self.border_edt_criterion.band_threshold
+                band_mask = target_f < (self.border_edt_criterion.band_threshold if self.border_edt_criterion else 0.98)
                 if band_mask.sum() > 0:
                     mae = (border_edt_pred[band_mask] - target_f[band_mask]).abs().mean()
                 else:
                     mae = torch.tensor(0.0, device=x.device)
             self.log(f"{stage}/border_edt_mae", mae, on_step=False, on_epoch=True,
                      prog_bar=(stage == "val"))
+
+        # Polygon vertex head loss (vmap + voff) — restricted to inside seg mask
+        has_poly_target = "vmap" in batch and "voff" in batch
+        if poly_pred is not None and has_poly_target:
+            seg_prob = torch.sigmoid(seg_logits).detach()
+            pl = self._compute_poly_loss(
+                poly_pred, batch["vmap"], batch["voff"],
+                batch.get("vmask", torch.ones_like(batch["vmap"])),
+                seg_mask=seg_prob,
+            )
+            loss = loss + pl
+            self.log(f"{stage}/poly_loss", pl, on_step=False, on_epoch=True)
+            with torch.no_grad():
+                vmap_prob = torch.sigmoid(poly_pred["vmap"])
+                vmap_gt   = batch["vmap"].float()
+                if vmap_gt.ndim == 3:
+                    vmap_gt = vmap_gt.unsqueeze(1)
+                tp = (vmap_prob > 0.5) & (vmap_gt > 0.5)
+                fp = (vmap_prob > 0.5) & (vmap_gt <= 0.5)
+                fn = (vmap_prob <= 0.5) & (vmap_gt > 0.5)
+                vmap_f1 = (2 * tp.sum() / (2 * tp.sum() + fp.sum() + fn.sum() + 1e-6))
+            self.log(f"{stage}/vmap_f1", vmap_f1, on_step=False, on_epoch=True,
+                     prog_bar=(stage == "val"))
+
+        # Frame field loss (edge + alignment + smoothness + coupling)
+        has_ff_target = "edge" in batch and "theta" in batch
+        if frame_field_pred is not None and has_ff_target:
+            ff_loss = self._compute_ff_loss(
+                frame_field_pred, batch["edge"], batch["theta"], seg_logits
+            )
+            ff_weight = getattr(self.cfg.loss, "frame_field_weight", 1.0)
+            loss = loss + ff_weight * ff_loss
+            self.log(f"{stage}/ff_loss", ff_loss, on_step=False, on_epoch=True)
+
+            with torch.no_grad():
+                # ff_angle_error: mean angular deviation at edge pixels (degrees)
+                # Primary early-stopping metric — measures directional quality
+                edge_mask = batch["edge"].float()
+                if edge_mask.ndim == 3:
+                    edge_mask = edge_mask.unsqueeze(1)
+                theta_gt = batch["theta"].float()
+                if theta_gt.ndim == 3:
+                    theta_gt = theta_gt.unsqueeze(1)
+                n_edge = edge_mask.sum().clamp(min=1.0)
+                if n_edge > 10:
+                    # Recover predicted angle: find θ that minimises |f(e^{iθ})|²
+                    # Approximation: use gradient direction from c2 (dominant term)
+                    # c2 = -(u² + v²) ≈ -2u² for u≈v, so angle(u) ≈ atan2(-Im(c2), -Re(c2))/2
+                    ff = frame_field_pred["ff"]
+                    c2_re = ff[:, 2:3]; c2_im = ff[:, 3:4]
+                    pred_angle = (torch.atan2(-c2_im, -c2_re) / 2.0) % torch.pi
+                    diff = (pred_angle - theta_gt).abs()
+                    diff = torch.min(diff, torch.pi - diff)
+                    ff_angle_err = (diff * edge_mask).sum() / n_edge * (180.0 / torch.pi)
+                else:
+                    ff_angle_err = torch.tensor(90.0, device=seg_logits.device)
+            self.log(f"{stage}/ff_angle_error", ff_angle_err, on_step=False, on_epoch=True,
+                     prog_bar=(stage == "val"))
+
+            # Edge F1 — sanity gate (should climb fast and stay high)
+            with torch.no_grad():
+                edge_prob_pred = frame_field_pred["edge"]
+                tp = ((edge_prob_pred > 0.5) & (edge_mask > 0.5)).sum().float()
+                fp = ((edge_prob_pred > 0.5) & (edge_mask <= 0.5)).sum().float()
+                fn = ((edge_prob_pred <= 0.5) & (edge_mask > 0.5)).sum().float()
+                edge_f1 = 2 * tp / (2 * tp + fp + fn + 1e-6)
+            self.log(f"{stage}/edge_f1", edge_f1, on_step=False, on_epoch=True)
 
         # Centerline distance transform loss
         has_centerline_target = "distance_transform" in batch

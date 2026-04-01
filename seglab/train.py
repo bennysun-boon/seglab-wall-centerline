@@ -317,11 +317,17 @@ def run_experiment(cfg: DictConfig, tag: Optional[str] = None) -> Path:
         print(f"Loading weights from: {transfer_ckpt}")
         ckpt = torch.load(transfer_ckpt, map_location="cpu")
         state_dict = ckpt.get("state_dict", ckpt)
-        missing, unexpected = lit_module.load_state_dict(state_dict, strict=False)
+        # Filter out keys with shape mismatches (e.g. heads whose in_channels changed)
+        model_state = lit_module.state_dict()
+        filtered = {k: v for k, v in state_dict.items()
+                    if k not in model_state or model_state[k].shape == v.shape}
+        skipped = [k for k, v in state_dict.items()
+                   if k in model_state and model_state[k].shape != v.shape]
+        if skipped:
+            print(f"  Skipped {len(skipped)} keys with shape mismatch (head architecture changed): {skipped}")
+        missing, unexpected = lit_module.load_state_dict(filtered, strict=False)
         if missing:
             print(f"  Missing keys: {len(missing)} (expected for fresh components)")
-        if unexpected:
-            print(f"  Unexpected keys: {len(unexpected)}")
         print(f"Model weights loaded. Optimizer and scheduler will start fresh.")
         print(f"{'='*60}\n")
 

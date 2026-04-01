@@ -19,6 +19,7 @@ def build_transforms(
     junction_heatmap: bool = False,
     distance_transform: bool = False,
     border_edt: bool = False,
+    **kwargs,
 ) -> A.Compose:
     aug = aug or {}
     if train:
@@ -61,5 +62,17 @@ def build_transforms(
         additional_targets["distance_transform"] = "mask"
     if border_edt:
         additional_targets["border_edt"] = "mask"
+    if kwargs.get("vmap"):
+        additional_targets["vmap"] = "mask"
+    if kwargs.get("voff_x"):
+        additional_targets["voff_x"] = "mask"
+    if kwargs.get("voff_y"):
+        additional_targets["voff_y"] = "mask"
+    if kwargs.get("vmask"):
+        additional_targets["vmask"] = "mask"
+    if kwargs.get("edge"):
+        additional_targets["edge"] = "mask"
+    if kwargs.get("theta"):
+        additional_targets["theta"] = "mask"
 
     return A.Compose(tfs, additional_targets=additional_targets)

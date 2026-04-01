@@ -1,0 +1,115 @@
+# PavingPolyHead transfer learning from epoch 9 seg+EDT checkpoint
+# Freeze encoder + seg + EDT; train only PavingPolyHead (vmap + voff)
+# ~1-2M new params; should converge in 5-10 epochs
+
+experiment: paving_poly_head
+seed: 0
+
+transfer_ckpt: /home/bensunshine/ml-training-platform/paving/TopoLoRA-SAM/Seglab/checkpoints/paving_full_retrain/paving/sam_topolora/seed0/epoch=9-val/border_edt_mae=0.0843.ckpt
+freeze_existing: true
+unfreeze_keywords: ["poly_head"]
+
+paths:
+  results_dir: results
+  checkpoints_dir: checkpoints
+  figures_dir: figures
+  tables_dir: tables
+  cache_dir: cache
+
+trainer:
+  max_epochs: 10
+  accelerator: gpu
+  devices: 1
+  precision: bf16-mixed
+  accumulate_grad_batches: 4   # effective batch = 4*4 = 16
+  log_every_n_steps: 50
+  limit_train_batches: 0.1    # POC: ~620 steps, ~37 min/epoch
+  deterministic: warn
+  gradient_clip_val: 1.0
+  early_stop_patience: 5
+  monitor: val/vmap_f1
+  monitor_mode: max
+
+dataset:
+  type: paving
+  name: paving
+  root: /home/bensunshine/ml-training-platform/paving/TopoLoRA-SAM/processed
+  val_ratio: 0.15
+  test_ratio: 0.15
+  size: 1024
+  sar: false
+  batch_size: 4
+  num_workers: 8
+  border_edt: true   # vmap/voff loaded automatically when vmap/ dir exists
+  aug:
+    scale: [0.75, 1.25]
+    hflip: 0.5
+    vflip: 0.5
+    rotate90_p: 0.5
+    color_jitter_p: 0.35
+    gauss_blur_p: 0.2
+    gauss_noise_p: 0.1
+
+model:
+  name: sam_topolora
+  sam_type: vit_b
+  sam_checkpoint: /home/bensunshine/ml-training-platform/paving/TopoLoRA-SAM/Seglab/checkpoints/sam_vit_b_01ec64.pth
+  train_mask_decoder: true
+  lora:
+    enabled: true
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_keywords: ["mlp", "qkv", "proj"]
+  adapter:
+    enabled: true
+    hidden_dim: 256
+    kernel_size: 3
+  prompt:
+    learnable: false
+  border_edt_head:
+    enabled: true
+    hidden_dim: 256
+  poly_head:
+    enabled: true
+    hidden_dim: 128   # lighter than EDT head — only new params trained
+
+loss:
+  # Frozen heads — weights set to 0 so gradients don't flow through them
+  bce_weight: 0.0
+  dice_weight: 0.0
+  cldice_weight: 0.0
+  boundary_weight: 0.0
+  border_edt_weight: 0.0
+
+  # Poly head (only active loss)
+  vmap_weight: 1.25       # FocalDice on sparse vertex heatmap
+  vmap_focal_alpha: 0.95  # positive class weight — vertices are ~0.01% of pixels
+  vmap_focal_gamma: 2.0
+  voff_weight: 5.0        # Masked L1 on offset vectors
+
+optimizer:
+  name: adamw
+  lr: 5e-4        # higher LR since only new head trains
+  weight_decay: 1e-4
+
+scheduler:
+  name: cosine    # cosine annealing over 10 epochs
+  T_max: 10
+
+logging:
+  wandb: false
+  mlflow: true
+  mlflow_validate: true
+  mlflow_experiment: paving-poly-head
+  project: seglab
+  entity: null
+  tags: ["paving", "poly_head", "transfer", "vmap_voff", "frozen_encoder"]
+
+artifacts:
+  save_test_preds: false
+  save_figures: false
+  sample_pixels: 100000
+  sample_pixels_per_image: 2000
+  max_qual: 4
+  bf_tol: 1
