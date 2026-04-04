@@ -65,7 +65,7 @@ class FrameFieldHead(nn.Module):
         edge_prob   = torch.sigmoid(edge_logits)
 
         ff_input    = torch.cat([features, edge_prob], dim=1)   # (B, 34, 256, 256)
-        ff_coeff    = torch.tanh(self.ff_branch(ff_input))       # (B, 4, 256, 256)
+        ff_coeff    = 2.0 * torch.tanh(self.ff_branch(ff_input))  # (B, 4, 256, 256) in [-2, 2] (lydorn spec)
 
         edge_out = F.interpolate(edge_prob, size=output_size, mode="bilinear", align_corners=False)
         ff_out   = F.interpolate(ff_coeff,  size=output_size, mode="bilinear", align_corners=False)

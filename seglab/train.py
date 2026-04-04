@@ -214,10 +214,26 @@ def build_dataloaders(cfg: DictConfig) -> Tuple[DataLoader, DataLoader, DataLoad
         with open(metadata_path) as f:
             tiles = json.load(f)["tiles"]
 
-        border_edt = bool(cfg.dataset.get("border_edt", True))
-        tf_train = build_transforms(size=size, train=True, aug=cfg.dataset.get("aug"),
-                                    border_edt=border_edt)
-        tf_eval  = build_transforms(size=size, train=False, border_edt=border_edt)
+        border_edt       = bool(cfg.dataset.get("border_edt", True))
+        frame_field      = bool(cfg.dataset.get("frame_field", False))
+        annotations_path = cfg.dataset.get("annotations_path", None)
+        ff_thickness     = int(cfg.dataset.get("ff_thickness", 2))
+        has_poly         = (Path(cfg.dataset.root) / "vmap").is_dir() and not frame_field
+
+        # When frame_field is active, rotate90 must be handled manually so theta
+        # values can be shifted by k*π/2. Strip it from albumentations aug config.
+        aug_cfg = dict(cfg.dataset.get("aug") or {})
+        ff_rotate90_p = 0.0
+        if frame_field and "rotate90_p" in aug_cfg:
+            ff_rotate90_p = float(aug_cfg.pop("rotate90_p"))
+
+        tf_train = build_transforms(size=size, train=True, aug=aug_cfg,
+                                    border_edt=border_edt,
+                                    vmap=has_poly, voff_x=has_poly, voff_y=has_poly,
+                                    edge=frame_field, theta=frame_field)
+        tf_eval  = build_transforms(size=size, train=False, border_edt=border_edt,
+                                    vmap=has_poly, voff_x=has_poly, voff_y=has_poly,
+                                    edge=frame_field, theta=frame_field)
 
         splits = make_split_indices_by_group(
             tiles, cfg.seed,
@@ -235,14 +251,23 @@ def build_dataloaders(cfg: DictConfig) -> Tuple[DataLoader, DataLoader, DataLoad
             print(f"  Test:  {meta['test_groups']} PDFs ({meta['test_tiles']} tiles)")
             print(f"{'='*60}\n")
 
-        train_ds = PavingDataset(cfg.dataset.root, splits["train"], tf_train, border_edt=border_edt)
-        val_ds   = PavingDataset(cfg.dataset.root, splits["val"],   tf_eval,  border_edt=border_edt)
-        test_ds  = PavingDataset(cfg.dataset.root, splits["test"],  tf_eval,  border_edt=border_edt)
+        ds_kwargs = dict(border_edt=border_edt, frame_field=frame_field,
+                         annotations_path=annotations_path, ff_thickness=ff_thickness)
+        train_ds = PavingDataset(cfg.dataset.root, splits["train"], tf_train, **ds_kwargs)
+        train_ds._ff_rotate90_p    = ff_rotate90_p
+        train_ds._ff_rotate_p      = float(aug_cfg.get("rotate_p", 0.0))
+        train_ds._ff_rotate_limit_deg = float(aug_cfg.get("rotate_limit_deg", 45.0))
+        val_ds   = PavingDataset(cfg.dataset.root, splits["val"],   tf_eval,  **ds_kwargs)
+        test_ds  = PavingDataset(cfg.dataset.root, splits["test"],  tf_eval,  **ds_kwargs)
 
     else:
         raise ValueError(f"Unknown dataset type: {ds_type}")
 
-    dl_kwargs = dict(batch_size=cfg.dataset.batch_size, num_workers=cfg.dataset.num_workers, pin_memory=True)
+    prefetch = int(cfg.dataset.get("prefetch_factor", 4))
+    num_workers = cfg.dataset.num_workers
+    dl_kwargs = dict(batch_size=cfg.dataset.batch_size, num_workers=num_workers,
+                     pin_memory=True, persistent_workers=num_workers > 0,
+                     prefetch_factor=prefetch if num_workers > 0 else None)
     train_loader = DataLoader(train_ds, shuffle=True, **dl_kwargs)
     val_loader = DataLoader(val_ds, shuffle=False, **dl_kwargs)
     test_loader = DataLoader(test_ds, shuffle=False, **dl_kwargs)
@@ -419,6 +444,7 @@ def run_experiment(cfg: DictConfig, tag: Optional[str] = None) -> Path:
         mode=monitor_mode,
         verbose=True,
         min_delta=early_stop_min_delta,
+        check_on_train_epoch_end=False,
     )
 
     # Custom progress bar for cleaner log files
@@ -446,6 +472,8 @@ def run_experiment(cfg: DictConfig, tag: Optional[str] = None) -> Path:
         deterministic=cfg.trainer.get("deterministic", True),
         gradient_clip_val=cfg.trainer.get("gradient_clip_val", 0.0),
         limit_train_batches=cfg.trainer.get("limit_train_batches", 1.0),
+        check_val_every_n_epoch=cfg.trainer.get("check_val_every_n_epoch", 1),
+        val_check_interval=cfg.trainer.get("val_check_interval", 1.0),
         callbacks=callbacks,
         logger=loggers,
         default_root_dir=str(run_dir),

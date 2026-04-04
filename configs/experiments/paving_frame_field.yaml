@@ -1,11 +1,9 @@
-# Frame Field Head — transfer learning from joint seg+EDT+poly checkpoint
-# Replaces BorderEDTHead + PavingPolyHead with a single FrameFieldHead.
-# Predicts: edge map (binary boundary) + frame field (4ch directional field).
-# Post-processing: skeleton → ASM optimization → corner detection → polygon graph.
+# Frame field + segmentation joint training from scratch.
+# Multi-task: seg regularises FF, FF sharpens seg boundaries (bidirectional).
+# Predicts: interior mask + edge map + 4ch frame field (c0, c2 coefficients).
+# Post-processing: skeleton → ASM → corner detection → polygon graph.
 #
-# Monitor: val/ff_angle_error (mean angular deviation at edge pixels, degrees)
-# NOT val/edge_f1 — edge detection is trivial on a frozen backbone and plateaus
-# in 2-3 epochs. ff_angle_error is the true signal for directional quality.
+# ff_angle_error uses trig (no torch.complex/sqrt) — safe to monitor from ep 0.
 
 experiment: paving_frame_field
 seed: 0
@@ -28,7 +26,7 @@ trainer:
   log_every_n_steps: 50
   deterministic: warn
   gradient_clip_val: 1.0
-  early_stop_patience: 5
+  early_stop_patience: 15
   monitor: val/ff_angle_error
   monitor_mode: min
 
@@ -41,17 +39,19 @@ dataset:
   size: 1024
   sar: false
   batch_size: 2
-  num_workers: 16
+  num_workers: 12
   prefetch_factor: 8
-  border_edt: false             # EDT head disabled — frame field subsumes it
-  frame_field: true             # on-the-fly edge + theta target generation
+  border_edt: false
+  frame_field: true
   annotations_path: /home/bensunshine/ml-training-platform/wall_centerline/TopoLoRA-SAM/data_full/annotations.json
-  ff_thickness: 2               # edge rasterisation thickness in pixels
+  ff_thickness: 6           # lydorn: line_width=6 (was 2)
   aug:
     scale: [0.75, 1.25]
     hflip: 0.5
     vflip: 0.5
-    rotate90_p: 0.5             # NOTE: theta is NOT rotation-aware yet — see transforms.py
+    rotate90_p: 0.5             # theta-aware: stripped from albumentations, applied manually (k*π/2 shift)
+    rotate_p: 0.0               # arbitrary rotation — disabled: all 700 source PDFs are landscape,
+    rotate_limit_deg: 45        # no rotated plans detected (wall_centerline risk doesn't apply here)
     color_jitter_p: 0.35
     gauss_blur_p: 0.2
     gauss_noise_p: 0.1
@@ -74,40 +74,56 @@ model:
   prompt:
     learnable: false
   border_edt_head:
-    enabled: false              # replaced by frame_field_head
+    enabled: false
   poly_head:
-    enabled: false              # replaced by frame_field_head
+    enabled: false
   frame_field_head:
     enabled: true
-    hidden_dim: 256             # ~260K params (edge_branch + ff_branch)
+    hidden_dim: 256
 
 loss:
-  # Segmentation head — trains jointly with frame field
   bce_weight: 1.0
-  dice_weight: 1.0
+  dice_weight: 0.2          # lydorn: dice_coef=0.2 (was 1.0)
   cldice_weight: 0.0
   boundary_weight: 0.0
-  border_edt_weight: 0.0   # EDT head disabled
-  vmap_weight: 0.0          # poly head disabled
-  voff_weight: 0.0          # poly head disabled
+  border_edt_weight: 0.0
+  vmap_weight: 0.0
+  voff_weight: 0.0
 
-  # Frame field losses (weights from FFL paper ratios)
-  frame_field_weight: 1.0       # outer multiplier on combined FF loss
-  ff_edge_weight: 0.5           # BCE + Dice on edge branch
-  ff_align_weight: 1.0          # primary: align field to GT tangent
-  ff_align90_weight: 0.2        # prevent line-field collapse
-  ff_smooth_weight: 0.005       # Dirichlet smoothness regularisation
-  ff_int_coupling_weight: 0.2   # couple field to seg gradient
-  ff_int_edge_weight: 0.2       # couple edge to seg gradient magnitude
+  # Loss normalization (FFL Section 3.2): run normalize_batches forward passes before
+  # training, average each loss component, divide by that value during training.
+  # All losses are ~1.0 at init before weighting.
+  normalize: true
+  normalize_batches: 100
+
+  # lydorn: seg=10, FF=1 → frame_field_weight = 1/10 = 0.1 relative to seg
+  frame_field_weight: 0.1   # was 1.0
+  ff_edge_weight: 0.0       # lydorn: NO edge loss in FF head (was 0.5)
+  ff_align_weight: 1.0      # lydorn: crossfield_align=1
+  ff_align90_weight: 0.2    # lydorn: crossfield_align90=0.2
+  ff_smooth_weight: 0.005   # lydorn: crossfield_smooth=0.005
+  # lydorn: coupling=[0,0,0.2] at epoch_thresholds=[0,5,10]
+  # Linear ramp from 0 → full weight between coupling_epoch_start and coupling_epoch_end
+  ff_int_coupling_weight: 0.2
+  ff_int_edge_weight: 0.2
+  coupling_epoch_start: 5   # coupling weight = 0 before this epoch
+  coupling_epoch_end: 10    # coupling weight = full after this epoch (linear ramp between)
 
 optimizer:
   name: adamw
-  lr: 5e-4          # high LR — only new head trains
+  lr: 5e-4              # default (frame_field_head residual + anything unmatched)
   weight_decay: 1e-4
+  param_groups:
+    - keywords: ["lora", "adapter"]
+      lr: 5e-6           # encoder — gentle, already conditioned on civil plan data
+    - keywords: ["mask_decoder"]
+      lr: 5e-5           # decoder — moderate
+    - keywords: ["frame_field_head"]
+      lr: 5e-4           # new head from scratch — fast
 
 scheduler:
-  name: cosine
-  T_max: 15
+  name: constant_with_warmup
+  warmup_steps: 500      # ~0.4 epochs; protects encoder from early FF noise gradients
 
 logging:
   wandb: false
@@ -116,7 +132,7 @@ logging:
   mlflow_experiment: paving-frame-field
   project: seglab
   entity: null
-  tags: ["paving", "frame_field", "transfer", "ffl", "frozen_backbone"]
+  tags: ["paving", "frame_field", "joint", "from_scratch", "multi_task"]
 
 artifacts:
   save_test_preds: false

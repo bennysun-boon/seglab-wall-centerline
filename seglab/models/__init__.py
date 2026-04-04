@@ -110,6 +110,11 @@ class LitBinarySeg(pl.LightningModule):
         self._worst_samples: List[Tuple[float, np.ndarray, np.ndarray, np.ndarray]] = []
         self._rng = np.random.default_rng(int(getattr(cfg, "seed", 0)))
 
+        # Per-loss normalization coefficients (FFL Section 3.2).
+        # Computed once in on_train_start from n_batches of forward passes.
+        # None = normalization disabled or not yet computed.
+        self._ff_loss_normalizers: Optional[Dict[str, float]] = None
+
     def setup(self, stage: str) -> None:
         # Compile the encoder here — after Lightning has loaded transfer weights
         # (doing it in __init__ causes key mismatches with torch.compile's _orig_mod prefix)
@@ -117,6 +122,90 @@ class LitBinarySeg(pl.LightningModule):
         if getattr(net, "_compile_encoder", False) and hasattr(torch, "compile"):
             if not hasattr(net.sam.image_encoder, "_orig_mod"):  # not already compiled
                 net.sam.image_encoder = torch.compile(net.sam.image_encoder)
+
+    def on_train_start(self) -> None:
+        if (self._has_frame_field_head
+                and getattr(self.cfg.loss, "normalize", False)
+                and self._ff_loss_normalizers is None):
+            n_batches = int(getattr(self.cfg.loss, "normalize_batches", 100))
+            self._compute_ff_normalizers(n_batches)
+
+    def _compute_ff_normalizers(self, n_batches: int) -> None:
+        """Compute per-loss normalization coefficients (FFL Section 3.2).
+
+        Runs n_batches through the current model in eval/no_grad mode and
+        averages every loss component — seg (BCE, Dice) and all 6 FF terms.
+        All losses are then divided by their normalizer before weighting, so
+        every term starts at ~1.0 regardless of raw magnitude.
+        """
+        from collections import defaultdict
+
+        accum: Dict[str, list] = defaultdict(list)
+        # Build a fresh dataloader instead of consuming the trainer's internal one,
+        # which can corrupt Lightning's fit loop state and cause val to be skipped.
+        from seglab.train import build_dataloaders
+        train_dl, _, _ = build_dataloaders(self.cfg)
+        loader = train_dl
+
+        self.net.eval()
+        with torch.no_grad():
+            for i, batch in enumerate(loader):
+                if i >= n_batches:
+                    break
+                if "edge" not in batch or "theta" not in batch:
+                    continue
+                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                         for k, v in batch.items()}
+                out = self(batch["image"])
+                if not isinstance(out, tuple):
+                    continue
+
+                seg_logits = out[0]
+                idx = 1
+                if self._has_junction_head:   idx += 1
+                if self._has_centerline_head: idx += 1
+                if self._has_border_edt_head: idx += 1
+                if self._has_poly_head:       idx += 1
+                if not (self._has_frame_field_head and idx < len(out)):
+                    break
+                ff_pred = out[idx]
+
+                # Seg losses
+                y = batch["mask"].float().unsqueeze(1)
+                seg_prob = torch.sigmoid(seg_logits)
+                accum["bce"].append(F.binary_cross_entropy_with_logits(seg_logits, y).item())
+                accum["dice"].append(dice_loss(seg_prob, y).item())
+
+                # FF losses
+                edge_target = batch["edge"].float()
+                theta_target = batch["theta"].float()
+                if edge_target.ndim == 3:
+                    edge_target = edge_target.unsqueeze(1)
+                if theta_target.ndim == 3:
+                    theta_target = theta_target.unsqueeze(1)
+
+                edge_pred = ff_pred["edge"]
+                ff_coeff  = ff_pred["ff"]
+
+                accum["edge"].append(ff_edge_loss(edge_pred, edge_target).item())
+                accum["align"].append(ff_align_loss(ff_coeff, theta_target, edge_target).item())
+                accum["align90"].append(ff_align90_loss(ff_coeff, theta_target, edge_target).item())
+                accum["smooth"].append(ff_smooth_loss(ff_coeff, edge_target).item())
+                accum["int_ff"].append(ff_interior_coupling_loss(ff_coeff, seg_logits).item())
+                accum["int_edge"].append(ff_edge_coupling_loss(edge_pred, seg_logits).item())
+
+        self.net.train()
+
+        if not accum:
+            print("[LossNorm] WARNING: no batches accumulated — normalizers not set")
+            return
+
+        self._ff_loss_normalizers = {
+            k: max(float(np.mean(v)), 1e-6) for k, v in accum.items()
+        }
+        print(f"[LossNorm] All loss normalizers from {len(next(iter(accum.values())))} batches:")
+        for k, v in self._ff_loss_normalizers.items():
+            print(f"  {k}: {v:.4f}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, ...]:
         out = self.net(x)
@@ -139,9 +228,10 @@ class LitBinarySeg(pl.LightningModule):
         bce = F.binary_cross_entropy_with_logits(logits, target_f)
         dice = dice_loss(torch.sigmoid(logits), target_f)
 
+        norms = self._ff_loss_normalizers or {}
         loss = (
-            self.cfg.loss.bce_weight * bce
-            + self.cfg.loss.dice_weight * dice
+            self.cfg.loss.bce_weight  * bce  / norms.get("bce",  1.0)
+            + self.cfg.loss.dice_weight * dice / norms.get("dice", 1.0)
         )
 
         if getattr(self.cfg.loss, "cldice_weight", 0.0) > 0:
@@ -285,8 +375,19 @@ class LitBinarySeg(pl.LightningModule):
         edge_target: torch.Tensor,
         theta_target: torch.Tensor,
         seg_logits: torch.Tensor,
+        current_epoch: int = 0,
     ) -> torch.Tensor:
-        """Combine 6 frame field losses with configurable weights."""
+        """Combine frame field losses with lydorn-aligned weights.
+
+        Follows FFL Section 3.2 normalization: each component divided by its
+        pre-computed normalizer so every term starts at ~1.0 before weighting.
+
+        Coupling losses linearly ramp from 0 → full weight between
+        coupling_epoch_start and coupling_epoch_end (lydorn spec:
+        epoch_thresholds=[0,5,10], values=[0,0,0.2] via scipy interp1d).
+        ff_edge_weight=0.0 by default — lydorn does NOT supervise edges from the
+        FF head; edge detection lives in the seg head.
+        """
         if edge_target.ndim == 3:
             edge_target = edge_target.unsqueeze(1)
         if theta_target.ndim == 3:
@@ -295,22 +396,40 @@ class LitBinarySeg(pl.LightningModule):
         edge_pred = ff_pred["edge"]
         ff_coeff  = ff_pred["ff"]
 
-        w_edge     = getattr(self.cfg.loss, "ff_edge_weight",         0.5)
+        w_edge     = getattr(self.cfg.loss, "ff_edge_weight",         0.0)
         w_align    = getattr(self.cfg.loss, "ff_align_weight",        1.0)
         w_align90  = getattr(self.cfg.loss, "ff_align90_weight",      0.2)
         w_smooth   = getattr(self.cfg.loss, "ff_smooth_weight",       0.005)
         w_int_ff   = getattr(self.cfg.loss, "ff_int_coupling_weight", 0.2)
         w_int_edge = getattr(self.cfg.loss, "ff_int_edge_weight",     0.2)
 
+        # lydorn: coupling=[0,0,0.2] at epoch_thresholds=[0,5,10]
+        # Linear ramp from 0 → full weight between start and end epochs
+        coupling_start = int(getattr(self.cfg.loss, "coupling_epoch_start", 5))
+        coupling_end = int(getattr(self.cfg.loss, "coupling_epoch_end", 10))
+        if current_epoch < coupling_start:
+            coupling_scale = 0.0
+        elif current_epoch >= coupling_end:
+            coupling_scale = 1.0
+        else:
+            coupling_scale = (current_epoch - coupling_start) / (coupling_end - coupling_start)
+        w_int_ff *= coupling_scale
+        w_int_edge *= coupling_scale
+
         l_edge      = ff_edge_loss(edge_pred, edge_target)
         l_align     = ff_align_loss(ff_coeff, theta_target, edge_target)
         l_align90   = ff_align90_loss(ff_coeff, theta_target, edge_target)
-        l_smooth    = ff_smooth_loss(ff_coeff)
+        l_smooth    = ff_smooth_loss(ff_coeff, edge_target)
         l_int_ff    = ff_interior_coupling_loss(ff_coeff, seg_logits)
         l_int_edge  = ff_edge_coupling_loss(edge_pred, seg_logits)
 
-        return (w_edge * l_edge + w_align * l_align + w_align90 * l_align90
-                + w_smooth * l_smooth + w_int_ff * l_int_ff + w_int_edge * l_int_edge)
+        norms = self._ff_loss_normalizers or {}
+        def _n(key: str, val: torch.Tensor) -> torch.Tensor:
+            return val / norms[key] if key in norms else val
+
+        return (w_edge * _n("edge", l_edge) + w_align * _n("align", l_align)
+                + w_align90 * _n("align90", l_align90) + w_smooth * _n("smooth", l_smooth)
+                + w_int_ff * _n("int_ff", l_int_ff) + w_int_edge * _n("int_edge", l_int_edge))
 
     def _shared_step(self, batch: Dict[str, torch.Tensor], stage: str) -> torch.Tensor:
         x = batch["image"]
@@ -423,7 +542,8 @@ class LitBinarySeg(pl.LightningModule):
         has_ff_target = "edge" in batch and "theta" in batch
         if frame_field_pred is not None and has_ff_target:
             ff_loss = self._compute_ff_loss(
-                frame_field_pred, batch["edge"], batch["theta"], seg_logits
+                frame_field_pred, batch["edge"], batch["theta"], seg_logits,
+                current_epoch=self.current_epoch,
             )
             ff_weight = getattr(self.cfg.loss, "frame_field_weight", 1.0)
             loss = loss + ff_weight * ff_loss
@@ -431,24 +551,32 @@ class LitBinarySeg(pl.LightningModule):
 
             with torch.no_grad():
                 # ff_angle_error: mean angular deviation at edge pixels (degrees)
-                # Primary early-stopping metric — measures directional quality
+                # Primary early-stopping metric — measures directional quality.
+                # Gated on c2 confidence (|c2| > 0.05) to avoid noisy atan2 when
+                # the model hasn't yet committed to a direction (small |c2|).
                 edge_mask = batch["edge"].float()
                 if edge_mask.ndim == 3:
                     edge_mask = edge_mask.unsqueeze(1)
                 theta_gt = batch["theta"].float()
                 if theta_gt.ndim == 3:
                     theta_gt = theta_gt.unsqueeze(1)
+                ff = frame_field_pred["ff"]
+                c2_re = ff[:, 2:3]; c2_im = ff[:, 3:4]
+                c2_mag = torch.sqrt(c2_re**2 + c2_im**2)
+                # Log c2 magnitude — key diagnostic: should grow as model learns directions
+                self.log(f"{stage}/c2_magnitude", c2_mag.mean(), on_step=False, on_epoch=True)
+                # Angle error only at edge pixels where c2 is confident
+                confident_mask = edge_mask * (c2_mag > 0.05).float()
+                n_confident = confident_mask.sum().clamp(min=1.0)
                 n_edge = edge_mask.sum().clamp(min=1.0)
                 if n_edge > 10:
-                    # Recover predicted angle: find θ that minimises |f(e^{iθ})|²
-                    # Approximation: use gradient direction from c2 (dominant term)
-                    # c2 = -(u² + v²) ≈ -2u² for u≈v, so angle(u) ≈ atan2(-Im(c2), -Re(c2))/2
-                    ff = frame_field_pred["ff"]
-                    c2_re = ff[:, 2:3]; c2_im = ff[:, 3:4]
                     pred_angle = (torch.atan2(-c2_im, -c2_re) / 2.0) % torch.pi
                     diff = (pred_angle - theta_gt).abs()
                     diff = torch.min(diff, torch.pi - diff)
-                    ff_angle_err = (diff * edge_mask).sum() / n_edge * (180.0 / torch.pi)
+                    ff_angle_err = (diff * confident_mask).sum() / n_confident * (180.0 / torch.pi)
+                    # Also log coverage: fraction of edge pixels where c2 is confident
+                    self.log(f"{stage}/c2_coverage", confident_mask.sum() / n_edge,
+                             on_step=False, on_epoch=True)
                 else:
                     ff_angle_err = torch.tensor(90.0, device=seg_logits.device)
             self.log(f"{stage}/ff_angle_error", ff_angle_err, on_step=False, on_epoch=True,
@@ -712,7 +840,30 @@ class LitBinarySeg(pl.LightningModule):
         opt_name = self.cfg.optimizer.get("name", "adamw").lower()
         lr = self.cfg.optimizer.get("lr", 1e-4)
         wd = self.cfg.optimizer.get("weight_decay", 1e-4)
-        if opt_name == "adam":
+
+        # Optional per-group LRs: list of {keywords: [...], lr: float}
+        pg_cfgs = list(self.cfg.optimizer.get("param_groups", []) or [])
+        if pg_cfgs:
+            matched: set[int] = set()
+            param_groups = []
+            for pg in pg_cfgs:
+                kws = list(pg["keywords"])
+                pg_lr = float(pg["lr"])
+                ids, params = [], []
+                for i, (n, p) in enumerate(self.named_parameters()):
+                    if any(kw in n for kw in kws) and p.requires_grad and i not in matched:
+                        ids.append(i)
+                        params.append(p)
+                matched.update(ids)
+                if params:
+                    param_groups.append({"params": params, "lr": pg_lr})
+            # Remaining params (not matched by any group) get the default lr
+            rest = [p for i, (_, p) in enumerate(self.named_parameters())
+                    if p.requires_grad and i not in matched]
+            if rest:
+                param_groups.append({"params": rest, "lr": lr})
+            opt = torch.optim.AdamW(param_groups, weight_decay=wd)
+        elif opt_name == "adam":
             opt = torch.optim.Adam(self.parameters(), lr=lr, weight_decay=wd)
         else:
             opt = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=wd)
@@ -759,6 +910,21 @@ class LitBinarySeg(pl.LightningModule):
         if sched_name == "cosine":
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=self.cfg.trainer.max_epochs)
             return {"optimizer": opt, "lr_scheduler": scheduler}
+
+        if sched_name == "constant_with_warmup":
+            # Step-level linear warmup → flat LR. Correct for differential LR
+            # param groups since LinearLR multiplies each group's lr uniformly.
+            warmup_steps = int(sched_cfg.get("warmup_steps", 500))
+            base_lrs = [pg.get("lr", lr) for pg in opt.param_groups]
+            min_lr = min(base_lrs)
+            scheduler = torch.optim.lr_scheduler.LinearLR(
+                opt,
+                start_factor=max(min_lr / max(base_lrs), 1e-8),
+                end_factor=1.0,
+                total_iters=warmup_steps,
+            )
+            return {"optimizer": opt,
+                    "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}
 
         return opt
 

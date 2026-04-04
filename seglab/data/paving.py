@@ -20,8 +20,52 @@ from seglab.utils.registry import register_dataset
 
 # ── Frame field target generation (on-the-fly, zero extra disk) ──────────────
 
+def _sample_bezier_polyline(
+    bezier_points: list, img_w: float, img_h: float, steps: int = 20
+) -> np.ndarray:
+    """Sample a Bezier spline defined by anchor+handle pairs into a dense polyline.
+
+    Each consecutive pair in bezier_points defines one cubic Bezier segment:
+        p0 (with handleOut as c1) → p1 (with handleIn as c2)
+
+    handleOut/handleIn are absolute coordinates (same space as x/y), not offsets.
+    steps: number of sample points per segment (higher = smoother curves).
+
+    Returns (N, 2) float32 array of [x, y] in image pixel coords.
+    """
+    pts = []
+    t_vals = np.linspace(0.0, 1.0, steps, endpoint=False)
+
+    for i in range(len(bezier_points) - 1):
+        p0 = bezier_points[i]
+        p1 = bezier_points[i + 1]
+
+        x0, y0 = p0["x"] * img_w, p0["y"] * img_h
+        x3, y3 = p1["x"] * img_w, p1["y"] * img_h
+
+        # Control point after p0
+        ho = p0.get("handleOut", p0)
+        x1, y1 = ho["x"] * img_w, ho["y"] * img_h
+
+        # Control point before p1
+        hi = p1.get("handleIn", p1)
+        x2, y2 = hi["x"] * img_w, hi["y"] * img_h
+
+        for t in t_vals:
+            mt = 1.0 - t
+            x = mt**3*x0 + 3*mt**2*t*x1 + 3*mt*t**2*x2 + t**3*x3
+            y = mt**3*y0 + 3*mt**2*t*y1 + 3*mt*t**2*y2 + t**3*y3
+            pts.append((x, y))
+
+    # Append final anchor
+    last = bezier_points[-1]
+    pts.append((last["x"] * img_w, last["y"] * img_h))
+
+    return np.array(pts, dtype=np.float32)
+
 def _build_edge_and_theta(
-    polygons: list[np.ndarray], H: int, W: int, thickness: int = 2
+    polygons: list[np.ndarray], H: int, W: int, thickness: int = 2,
+    closed: list[bool] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Rasterise polygon edges and compute per-pixel tangent angles.
 
@@ -38,11 +82,13 @@ def _build_edge_and_theta(
     sin2 = np.zeros((H, W), np.float64)
     cos2 = np.zeros((H, W), np.float64)
 
-    for poly in polygons:
+    for pi, poly in enumerate(polygons):
         n = len(poly)
         if n < 2:
             continue
-        for i in range(n):
+        is_closed = closed[pi] if closed is not None else True
+        n_edges = n if is_closed else n - 1
+        for i in range(n_edges):
             p0 = poly[i]
             p1 = poly[(i + 1) % n]
             dx, dy = float(p1[0] - p0[0]), float(p1[1] - p0[1])
@@ -61,6 +107,13 @@ def _build_edge_and_theta(
     has_edge = edge > 0
     if has_edge.any():
         theta[has_edge] = (np.arctan2(sin2[has_edge], cos2[has_edge]) / 2.0) % math.pi
+        # Zero out theta at corner pixels where two edges with conflicting directions
+        # overlap. Low resultant magnitude = conflicting angles = corner/junction.
+        # These pixels remain in the edge map but are excluded from theta supervision.
+        resultant = np.sqrt(sin2 ** 2 + cos2 ** 2)
+        corner_mask = has_edge & (resultant < 0.5)
+        theta[corner_mask] = 0.0
+        edge[corner_mask] = 0.0   # exclude corners from edge supervision too
 
     return edge, theta
 
@@ -88,6 +141,9 @@ class PavingDataset(Dataset):
         self.border_edt = border_edt
         self.frame_field = frame_field
         self._ff_thickness = ff_thickness
+        self._ff_rotate90_p = 0.0        # set by PavingDataModule when frame_field=True
+        self._ff_rotate_p = 0.0          # arbitrary rotation probability (opt-in)
+        self._ff_rotate_limit_deg = 45.0 # max rotation ±degrees
 
         metadata_path = self.root / "tile_metadata.json"
         if not metadata_path.exists():
@@ -212,25 +268,38 @@ class PavingDataset(Dataset):
             img_h  = tile_meta.get("render_height", tile_meta.get("img_h", 2160))
             H, W   = mask.shape[:2]
             polygons = []
+            closed_flags = []
             for ann in self._img_anns.get(img_id, []):
                 mtype = ann.get("measurement_type", "").upper()
                 seg   = ann.get("segmentation", [[]])[0]
                 if mtype not in ("POLYGON", "POLYLINE") or len(seg) < 2:
                     continue
+                # segmentation is already a dense polyline (Bezier pre-sampled
+                # by the annotation tool), no need to re-sample bezier_points.
                 verts = np.array([[p["x"] * img_w, p["y"] * img_h] for p in seg],
                                  dtype=np.float32)
-                if not np.isfinite(verts).all():
+                if len(verts) < 2 or not np.isfinite(verts).all():
                     continue
                 local = verts.copy()
                 local[:, 0] -= tile_x
                 local[:, 1] -= tile_y
-                in_tile = ((local[:, 0] >= 0) & (local[:, 0] < W) &
-                           (local[:, 1] >= 0) & (local[:, 1] < H))
-                if in_tile.any():
-                    local[:, 0] = np.clip(local[:, 0], 0, W - 1)
-                    local[:, 1] = np.clip(local[:, 1], 0, H - 1)
+                # Check if any segment intersects the tile — guard against
+                # annotations entirely outside this tile.
+                # Do NOT clip vertices: cv2.line handles out-of-bounds coords
+                # natively. Clipping would distort line directions and create
+                # spurious diagonal lines at tile edges.
+                seg_mins_x = np.minimum(local[:-1, 0], local[1:, 0])
+                seg_maxs_x = np.maximum(local[:-1, 0], local[1:, 0])
+                seg_mins_y = np.minimum(local[:-1, 1], local[1:, 1])
+                seg_maxs_y = np.maximum(local[:-1, 1], local[1:, 1])
+                hits_tile = ((seg_maxs_x >= 0) & (seg_mins_x < W) &
+                             (seg_maxs_y >= 0) & (seg_mins_y < H))
+                if hits_tile.any():
                     polygons.append(local)
-            edge, theta = _build_edge_and_theta(polygons, H, W, self._ff_thickness)
+                    closed_flags.append(mtype == "POLYGON")
+            edge, theta = _build_edge_and_theta(
+                polygons, H, W, self._ff_thickness, closed=closed_flags
+            )
             ff_targets["edge"] = edge
             ff_targets["theta"] = theta
 
@@ -259,6 +328,66 @@ class PavingDataset(Dataset):
             result["border_edt"] = np.zeros_like(mask, dtype=np.float32)
 
         # Frame field targets
+        # Apply theta-aware rotate90 AFTER albumentations (which cannot update
+        # angular values). k=0 no-op, k=1 → +90°, k=2 → +180°, k=3 → +270°.
+        # 0° and 180° are fine (theta is π-periodic), only 90°/270° need theta shift.
+        # Theta-aware arbitrary rotation (continuous angle)
+        # Applied before rotate90 — both can be active independently.
+        if ff_targets and self._ff_rotate_p > 0:
+            import random as _random2
+            if _random2.random() < self._ff_rotate_p:
+                angle_deg = _random2.uniform(-self._ff_rotate_limit_deg, self._ff_rotate_limit_deg)
+                angle_rad = angle_deg * math.pi / 180.0
+                # Shift theta values first (uniform addition, order-independent with spatial rotation)
+                theta_shifted = (ff_targets["theta"] + angle_rad) % math.pi
+                # Rotate spatial maps with cv2.warpAffine (preserves interpolation)
+                import torch as _torch2
+                def _rotate_arr(arr, deg):
+                    if isinstance(arr, _torch2.Tensor):
+                        # Tensor (C,H,W) or (H,W)
+                        np_arr = arr.numpy()
+                        was_tensor = True
+                    else:
+                        np_arr = arr
+                        was_tensor = False
+                    if np_arr.ndim == 3:
+                        C, H, W = np_arr.shape
+                        M = cv2.getRotationMatrix2D((W / 2, H / 2), deg, 1.0)
+                        rotated = np.stack([cv2.warpAffine(np_arr[c], M, (W, H),
+                                            flags=cv2.INTER_LINEAR,
+                                            borderMode=cv2.BORDER_REFLECT_101)
+                                            for c in range(C)])
+                    else:
+                        H, W = np_arr.shape
+                        M = cv2.getRotationMatrix2D((W / 2, H / 2), deg, 1.0)
+                        rotated = cv2.warpAffine(np_arr, M, (W, H),
+                                                 flags=cv2.INTER_LINEAR,
+                                                 borderMode=cv2.BORDER_REFLECT_101)
+                    return _torch2.from_numpy(rotated) if was_tensor else rotated
+
+                image = _rotate_arr(image, angle_deg)
+                mask  = _rotate_arr(mask, angle_deg)
+                ff_targets["edge"]  = _rotate_arr(ff_targets["edge"], angle_deg)
+                ff_targets["theta"] = _rotate_arr(theta_shifted, angle_deg)
+
+        if ff_targets and self._ff_rotate90_p > 0:
+            import random as _random
+            if _random.random() < self._ff_rotate90_p:
+                k = _random.randint(1, 3)   # 1, 2, or 3 quarter-turns
+                # Rotate spatial arrays: np.rot90 with k rotates CCW
+                # image is a tensor (C,H,W) after ToTensorV2 — handle both
+                import torch as _torch
+                def _rot90(arr, k):
+                    if isinstance(arr, _torch.Tensor):
+                        return _torch.rot90(arr, k, dims=(-2, -1))
+                    return np.ascontiguousarray(np.rot90(arr, k))
+                image = _rot90(image, k)
+                mask  = _rot90(mask, k)
+                ff_targets["edge"]  = _rot90(ff_targets["edge"], k)
+                # Shift theta values: a k*90° CCW rotation adds k*π/2 to tangent angles
+                theta_rot = (ff_targets["theta"] + k * math.pi / 2.0) % math.pi
+                ff_targets["theta"] = _rot90(theta_rot, k)
+
         if ff_targets:
             result["edge"]  = ff_targets.get("edge",  np.zeros_like(mask, dtype=np.float32))
             result["theta"] = ff_targets.get("theta", np.zeros_like(mask, dtype=np.float32))

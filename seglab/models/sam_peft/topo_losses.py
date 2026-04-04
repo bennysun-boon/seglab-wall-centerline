@@ -283,18 +283,38 @@ def ff_align90_loss(ff: torch.Tensor, theta: torch.Tensor,
     return (edge_mask * poly_sq).sum() / n
 
 
-def ff_smooth_loss(ff: torch.Tensor) -> torch.Tensor:
-    """Dirichlet energy — penalises spatial gradients in c0 and c2.
+def ff_smooth_loss(ff: torch.Tensor,
+                   edge_mask: torch.Tensor | None = None) -> torch.Tensor:
+    """Laplacian penalty — penalises curvature in c0 and c2 (lydorn spec).
 
-    Encourages the frame field to be spatially smooth across the image,
-    which prevents noisy frame field predictions in flat regions.
+    Uses the same 3x3 Laplacian kernel as lydorn's LaplacianPenalty:
+        [[0.5, 1.0, 0.5],
+         [1.0, -6., 1.0],
+         [0.5, 1.0, 0.5]] / 12
+
+    Smoothness is only enforced in non-edge regions (lydorn spec:
+    avg_penalty = mean(penalty * gt_edges_inv)). At edge pixels the frame
+    field is allowed to be discontinuous.
+
+    Args:
+        ff:        (B, 4, H, W) frame field coefficients
+        edge_mask: (B, 1, H, W) float, 1 at GT edge pixels. If None,
+                   smoothness is applied everywhere (legacy behaviour).
     """
-    def _grad_mag_sq(t: torch.Tensor) -> torch.Tensor:
-        dx = t[:, :, :, 1:] - t[:, :, :, :-1]
-        dy = t[:, :, 1:, :] - t[:, :, :-1, :]
-        return (dx ** 2).mean() + (dy ** 2).mean()
+    # Laplacian kernel (lydorn: frame_field_utils.LaplacianPenalty)
+    kernel = ff.new_tensor([[0.5, 1.0, 0.5],
+                            [1.0, -6., 1.0],
+                            [0.5, 1.0, 0.5]]) / 12.0
+    kernel = kernel[None, None, :, :].expand(4, -1, -1, -1)  # (4,1,3,3)
+    penalty = torch.abs(F.conv2d(ff, kernel, padding=1, groups=4))  # (B,4,H,W)
 
-    return _grad_mag_sq(ff[:, :2]) + _grad_mag_sq(ff[:, 2:])  # c0 + c2
+    if edge_mask is not None:
+        if edge_mask.ndim == 3:
+            edge_mask = edge_mask.unsqueeze(1)
+        non_edge = (1.0 - edge_mask).clamp(0.0, 1.0)
+        return torch.mean(penalty * non_edge)
+
+    return penalty.mean()
 
 
 def ff_interior_coupling_loss(ff: torch.Tensor,
